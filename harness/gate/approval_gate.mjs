@@ -183,5 +183,8 @@ export class ApprovalGate {
 }
 
 function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise((r) => {
+    const t = setTimeout(r, ms);
+    if (typeof t.unref === 'function') t.unref(); // waiting must not pin the process
+  });
 }
