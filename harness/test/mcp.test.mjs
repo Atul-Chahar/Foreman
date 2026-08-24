@@ -95,6 +95,27 @@ test('local-git: merge is a real merge; conflicts throw MERGE_CONFLICT', async (
   assert.equal(status.stdout.trim(), '');
 });
 
+test('local-git: branch diff and read-file-at-ref work without a PR', async () => {
+  const { dir, stateFile } = scratchRepo();
+  const mcp = new LocalGitMCP(dir, stateFile);
+
+  await mcp.callTool('create_branch', { branch: 'foreman/task-009' });
+  await mcp.callTool('commit_files', {
+    branch: 'foreman/task-009',
+    files: [{ path: 'src/at-ref.mjs', content: 'export const marker = "at-ref";\n' }],
+    message: 'add at-ref',
+  });
+
+  const diff = await mcp.callTool('get_branch_diff', { branch: 'foreman/task-009' });
+  assert.match(diff, /at-ref\.mjs/);
+
+  const content = await mcp.callTool('read_file_at_ref', { branch: 'foreman/task-009', path: 'src/at-ref.mjs' });
+  assert.match(content, /at-ref/);
+
+  const missing = await mcp.callTool('read_file_at_ref', { branch: 'foreman/task-009', path: 'src/absent.mjs' });
+  assert.equal(missing, null);
+});
+
 test('rate limiter: bursts beyond capacity serialize instead of failing', async () => {
   const rl = new RateLimiter({ capacity: 3, refillPerSec: 1000, maxAttempts: 2 });
   let concurrent = 0;

@@ -25,8 +25,11 @@ const REMOTE_TOOLS = {
   get_pull_request_diff: 'get_pull_request_diff',
   merge_pull_request: 'merge_pull_request',
   close_issue: 'close_issue',
-  commit_files: null, // remote backend composes it from per-file calls below
   create_issue: 'create_issue',
+  // pre-PR review tools: diff a branch directly, read a file at a ref
+  get_branch_diff: null, // composed: compare_commits against base
+  read_file_at_ref: 'get_file_contents',
+  commit_files: null, // remote backend composes it from per-file calls below
   push: null,
 };
 
@@ -80,13 +83,36 @@ export class GitHubMCP {
       }
       const remoteName = REMOTE_TOOLS[tool];
       if (remoteName === null) {
-        // compose commit_files remotely from create_or_update_file calls
         if (tool === 'commit_files') return this._remoteCommitFiles(args);
+        if (tool === 'get_branch_diff') return this._remoteBranchDiff(args);
         return { ok: true };
       }
-      const res = await this.remote.callTool(remoteName, args);
+      const res = await this.remote.callTool(remoteName, this._translateArgs(tool, args));
       return JSON.parse(findText(res) ?? 'null');
     });
+  }
+
+  /** The GitHub MCP server names some args differently than our tool surface. */
+  _translateArgs(tool, args) {
+    if (tool === 'read_file_at_ref') {
+      return { owner: this.owner, repo: this.repo, path: args.path, ref: args.branch };
+    }
+    return args;
+  }
+
+  async _remoteBranchDiff({ branch, base = 'main' }) {
+    if (!this.owner || !this.repo) {
+      throw new Error('FOREMAN_TARGET_GITHUB must be owner/repo for the remote MCP backend');
+    }
+    const res = await this.remote.callTool('compare_commits', {
+      owner: this.owner, repo: this.repo, base, head: branch,
+    });
+    const parsed = JSON.parse(findText(res) ?? '{}');
+    // normalize: the review stage only needs the unified diff text
+    return (parsed.files ?? [])
+      .map((f) => f.patch ? `diff --git a/${f.filename} b/${f.filename}\n${f.patch}` : '')
+      .filter(Boolean)
+      .join('\n');
   }
 
   async _remoteCommitFiles({ branch, files, message }) {
@@ -111,6 +137,8 @@ export class GitHubMCP {
   createPR(branch, title, body) { return this.call('create_pull_request', { branch, title, body }, { tier: 'T1' }); }
   getPR(number) { return this.call('get_pull_request', { number }, { tier: 'T0' }); }
   getPRDiff(number) { return this.call('get_pull_request_diff', { number }, { tier: 'T0' }); }
+  getBranchDiff(branch, base = 'main') { return this.call('get_branch_diff', { branch, base }, { tier: 'T0' }); }
+  readFileAtRef(branch, filePath) { return this.call('read_file_at_ref', { branch, path: filePath }, { tier: 'T0' }); }
   mergePR(number) { return this.call('merge_pull_request', { number }, { tier: 'T2' }); }
   closeIssue(number) { return this.call('close_issue', { number }, { tier: 'T2' }); }
 }

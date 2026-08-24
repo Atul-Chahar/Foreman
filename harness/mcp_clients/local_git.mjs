@@ -134,6 +134,19 @@ export class LocalGitMCP {
     return r.stdout;
   }
 
+  /** Diff a branch against base without needing a PR. Review runs pre-PR. */
+  async get_branch_diff({ branch, base = 'main' }) {
+    const r = this._git(['diff', `${base}...${branch}`], { allowFail: true });
+    return r.stdout;
+  }
+
+  /** File contents at a branch ref; null when the file does not exist there. */
+  async read_file_at_ref({ branch, path: filePath }) {
+    const r = this._git(['show', `${branch}:${filePath}`], { allowFail: true });
+    if (r.status !== 0) return null;
+    return r.stdout;
+  }
+
   /** Real merge into main. Conflicts throw — the merge queue marks the PR
    *  needs-human; nothing force-resolves a conflict, ever. */
   async merge_pull_request({ number }) {
