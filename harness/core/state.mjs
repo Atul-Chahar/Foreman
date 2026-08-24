@@ -29,7 +29,7 @@ export const TRANSITIONS = Object.freeze({
   [T.NEEDS_HUMAN]: [T.PLANNED, T.DISPATCHED, T.REJECTED], // human resolves
   [T.MERGED]: [],
   [T.REJECTED]: [],
-  [T.FAILED]: [T.DISPATCHED, T.PLANNED, T.REJECTED], // bounded retry, or human drops it
+  [T.FAILED]: [T.DISPATCHED, T.PLANNED, T.REJECTED, T.NEEDS_HUMAN], // bounded retry, escalation, or human drops it
 });
 
 export const TERMINAL_STATES = Object.freeze(
