@@ -1,0 +1,22 @@
+{
+  "name": "foreman",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Supervised parallel agentic development: a swarm of subagents implements a backlog, and nothing reaches main until a human approves it.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "workspaces": [
+    "harness",
+    "apps/console"
+  ],
+  "scripts": {
+    "foreman": "node harness/cli.mjs",
+    "demo": "node harness/cli.mjs demo",
+    "console": "node apps/console/server.mjs",
+    "seed": "node scripts/seed.mjs",
+    "test": "node --test harness/test apps/console/test"
+  }
+}

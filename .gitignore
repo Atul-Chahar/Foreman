@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# local state — Foreman persists runs to SQLite, never to git
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# secrets — copy .env.example to .env and fill in locally
+.env
+.env.local
+
+# runtime artifacts (a clean run's log is copied into evidence/ before submission)
+evidence/audit.log
+evidence/sessions/
+demo-target/.git
+demo-target-run/
+
+# os / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
