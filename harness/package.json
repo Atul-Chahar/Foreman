@@ -1,0 +1,16 @@
+{
+  "name": "@foreman/harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The Foreman agent harness: swarm orchestration, approval gate, policy engine, merge queue.",
+  "exports": {
+    ".": "./orchestrator.mjs",
+    "./store": "./core/store.mjs",
+    "./policy": "./policy/engine.mjs",
+    "./gate": "./gate/approval_gate.mjs"
+  },
+  "scripts": {
+    "test": "node --test test"
+  }
+}

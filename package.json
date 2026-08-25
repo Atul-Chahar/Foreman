@@ -6,17 +6,16 @@
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=20.11.0"
+    "node": ">=22.5.0"
   },
   "workspaces": [
-    "harness",
-    "apps/console"
+    "harness"
   ],
   "scripts": {
     "foreman": "node harness/cli.mjs",
     "demo": "node harness/cli.mjs demo",
     "console": "node apps/console/server.mjs",
     "seed": "node scripts/seed.mjs",
-    "test": "node --test harness/test apps/console/test"
+    "test": "node --test \"harness/test/*.test.mjs\""
   }
 }
