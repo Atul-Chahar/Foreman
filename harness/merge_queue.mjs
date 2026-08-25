@@ -116,20 +116,42 @@ export class MergeQueue {
         this.bus.emitEvent('pr.rejected', { taskId: task.id, pr: task.pr_number }, (e) => this.store.persistEvent(e));
         return;
       }
+      await this.executeMerge(task, this._authorizationFor(task, verdict));
+      return;
     }
 
     if (task.state === STATES.AWAITING_APPROVAL) {
       // approved earlier (e.g. process restarted between approve and merge)
-      const approvals = this.store.listApprovals('approved')
-        .filter((a) => a.task_id === task.id && a.action === 'merge_to_main');
-      if (approvals.length === 0) return; // still pending; nothing to do
+      const auth = this._authorizationFor(task);
+      if (!auth) return; // still pending; nothing to do
+      await this.executeMerge(task, auth);
+      return;
     }
 
     await this.executeMerge(task);
   }
 
+  /**
+   * The T2 authorization that travels with the merge call: the approval id
+   * and the human who made the decision. The merge facade refuses to execute
+   * without it — the gate's yes is what unlocks the irreversible action.
+   */
+  _authorizationFor(task, verdict = null) {
+    let a = null;
+    if (verdict?.id) {
+      const row = this.store.getApproval(verdict.id);
+      if (row?.status === 'approved') a = row;
+    }
+    if (!a) {
+      [a] = this.store
+        .listApprovals('approved')
+        .filter((x) => x.task_id === task.id && x.action === 'merge_to_main');
+    }
+    return a ? { approvalId: a.id, decidedBy: a.decided_by ?? 'human:unknown' } : null;
+  }
+
   /** The serialized, verified merge. One at a time, rebase-test first. */
-  async executeMerge(task) {
+  async executeMerge(task, authorization) {
     this.bus.emitEvent('merge.started', { taskId: task.id, pr: task.pr_number }, (e) => this.store.persistEvent(e));
     try {
       // rebase + re-test against the current main
@@ -144,7 +166,7 @@ export class MergeQueue {
         return; // queue keeps moving; one conflict never stalls it
       }
 
-      const merged = await this.github.mergePR(task.pr_number);
+      const merged = await this.github.mergePR(task.pr_number, authorization);
       this.store.transitionTask(task.id, STATES.MERGED, { result: { ...(task.result ?? {}), merged: merged } });
       this.bus.emitEvent('merge.completed', {
         taskId: task.id, pr: task.pr_number, head: merged.head,
