@@ -143,6 +143,12 @@ export class Dispatcher {
       if (result?.ok) {
         this.store.transitionTask(task.id, STATES.TESTS_PASSED, { result });
         this.bus.emitEvent('agent.tests_passed', { taskId: task.id, branch: branchForTask(task.id) }, (e) => this.store.persistEvent(e));
+      } else if (result?.permanent) {
+        // a deterministic refusal can never succeed on retry — surface it now
+        this.store.transitionTask(task.id, STATES.NEEDS_HUMAN, { result });
+        this.bus.emitEvent('agent.blocked', {
+          taskId: task.id, reason: result.reason ?? 'permanent failure', permanent: true,
+        }, (e) => this.store.persistEvent(e));
       } else if (attempts <= this.maxRetries) {
         this.store.transitionTask(task.id, STATES.TESTS_FAILED, { result: result ?? {} });
         this.bus.emitEvent('agent.tests_failed', {
@@ -191,10 +197,12 @@ export class Dispatcher {
 }
 
 function withTimeout(promise, ms, message) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
-  ]);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+    if (typeof timer.unref === 'function') timer.unref(); // a lost race must not pin the process
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 async function backoff(attempt) {

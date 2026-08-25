@@ -96,7 +96,13 @@ export class LocalBackend {
   async run({ spec, branch }) {
     const files = implementationFor(spec);
     if (files.length === 0) {
-      return { ok: false, reason: 'spec carries no impl block and no local backend can derive one — use the TrueForge backend for open-ended specs' };
+      // permanent: no retry can conjure an implementation — a human or the
+      // TrueForge backend must take this spec
+      return {
+        ok: false,
+        permanent: true,
+        reason: 'spec carries no impl block and no local backend can derive one — use the TrueForge backend for open-ended specs',
+      };
     }
 
     await this.github.createBranch(branch, 'main');
