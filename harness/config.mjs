@@ -51,6 +51,7 @@ export function loadConfig(env = process.env, opts = {}) {
     // TrueForge backend
     trueforgeUrl: e.FOREMAN_TRUEFORGE_URL || '',
     trueforgeToken: e.FOREMAN_TRUEFORGE_TOKEN || '',
+    trueforgeModel: e.FOREMAN_TRUEFORGE_MODEL || '',
 
     // policy — T2 is not configurable anywhere; that is the point.
     t1Auto: bool(e.FOREMAN_T1_AUTO, false),

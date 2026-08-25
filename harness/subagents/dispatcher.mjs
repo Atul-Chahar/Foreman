@@ -94,21 +94,24 @@ export class Dispatcher {
   }
 
   _filesFree(task) {
+    return this._lockKeys(task).every((f) => !this._fileLocks.has(f) || this._fileLocks.get(f) === task.id);
+  }
+
+  /** Lock set = touches ∪ context_files. Restricting locks to the src/lib
+   *  subset would let two tasks that both edit the same README or config
+   *  run concurrently and collide at merge time. */
+  _lockKeys(task) {
     const spec = task.spec ?? {};
-    const touches = spec.touches?.length ? spec.touches : [`*${task.id}`];
-    return touches.every((f) => !this._fileLocks.has(f) || this._fileLocks.get(f) === task.id);
+    const keys = [...new Set([...(spec.touches ?? []), ...(spec.context_files ?? [])])];
+    return keys.length ? keys : [`*${task.id}`];
   }
 
   _lockFiles(task) {
-    const spec = task.spec ?? {};
-    const touches = spec.touches?.length ? spec.touches : [`*${task.id}`];
-    for (const f of touches) this._fileLocks.set(f, task.id);
+    for (const f of this._lockKeys(task)) this._fileLocks.set(f, task.id);
   }
 
   _unlockFiles(task) {
-    const spec = task.spec ?? {};
-    const touches = spec.touches?.length ? spec.touches : [`*${task.id}`];
-    for (const f of touches) {
+    for (const f of this._lockKeys(task)) {
       if (this._fileLocks.get(f) === task.id) this._fileLocks.delete(f);
     }
   }
@@ -134,10 +137,19 @@ export class Dispatcher {
     this._wake();
 
     try {
+      // The abort controller ties the timeout to the backend call: when the
+      // deadline fires, the in-flight work is cancelled, not orphaned.
+      const ac = new AbortController();
       const result = await withTimeout(
-        this.backend.run({ spec: task.spec, branch: branchForTask(task.id), taskId: task.id }),
+        this.backend.run({
+          spec: task.spec,
+          branch: branchForTask(task.id),
+          taskId: task.id,
+          signal: ac.signal,
+        }),
         this.timeoutMs,
         `agent ${task.id} timed out after ${this.timeoutMs}ms`,
+        () => ac.abort(),
       );
 
       if (result?.ok) {
@@ -196,10 +208,13 @@ export class Dispatcher {
   }
 }
 
-function withTimeout(promise, ms, message) {
+function withTimeout(promise, ms, message, onTimeout) {
   let timer;
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), ms);
+    timer = setTimeout(() => {
+      try { onTimeout?.(); } catch { /* never block the rejection */ }
+      reject(new Error(message));
+    }, ms);
     if (typeof timer.unref === 'function') timer.unref(); // a lost race must not pin the process
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));

@@ -30,9 +30,11 @@ export class SpendMeter {
   }
 
   /** Reserve one agent run. Returns false (and fires the cap event once)
-   *  when the budget is exhausted. */
+   *  when the budget is exhausted — including a reservation that would land
+   *  exactly ON the cap: that run is allowed and immediately flagged, so
+   *  nothing can ever slip past the ceiling unnoticed. */
   reserve(actor = 'system:dispatcher') {
-    if (this.overCap) {
+    const fireCapHit = () => {
       if (this.store.getMeta('spend.cap_hit') !== '1') {
         this.store.setMeta('spend.cap_hit', '1');
         this.audit.record({
@@ -41,11 +43,16 @@ export class SpendMeter {
         });
         this.bus.emitEvent('spend.cap_hit', { spentUsd: this.spentUsd, capUsd: this.capUsd }, (e) => this.store.persistEvent(e));
       }
+    };
+
+    if (this.overCap || this.spentUsd + this.perRunUsd > this.capUsd) {
+      fireCapHit();
       return false;
     }
     const runs = Number(this.store.getMeta('spend.runs') || 0) + 1;
     this.store.setMeta('spend.runs', String(runs));
     this.bus.emitEvent('spend.tick', { runs, spentUsd: round(runs * this.perRunUsd), capUsd: this.capUsd }, (e) => this.store.persistEvent(e));
+    if (this.overCap) fireCapHit();
     return true;
   }
 
