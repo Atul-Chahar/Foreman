@@ -15,7 +15,25 @@ import { slug } from '../core/ids.mjs';
 const FILE_RE = /\b((?:src|lib|test|tests|app|harness|scripts)\/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+)/g;
 const CMD_RE = /^\s*(?:test|run tests|command)\s*:\s*`?([^`\n]+)`?/im;
 const CRITERIA_RE = /^\s*(?:acceptance|criteria|done when)\s*:\s*$/im;
-const IMPL_RE = /```impl\s*\n([\s\S]*?)```/;
+/** Fenced impl block: JSON array of {path, content} the local backend executes. */
+const IMPL_RE = /```impl\s*\r?\n([\s\S]*?)```/;
+
+/**
+ * Lift a fenced ```impl block into a validated file list. Invalid JSON or
+ * malformed entries yield [] — the local backend then refuses the task
+ * permanently instead of writing garbage.
+ */
+export function extractImpl(body) {
+  const m = String(body ?? '').match(IMPL_RE);
+  if (!m) return [];
+  try {
+    const parsed = JSON.parse(m[1].trim());
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((f) => f?.path && f?.content !== undefined);
+  } catch {
+    return [];
+  }
+}
 
 /** Extract a structured spec from a raw issue. Pure; safe to re-run. */
 export function enhanceSpec(issue, { taskId }) {
@@ -56,14 +74,7 @@ export function enhanceSpec(issue, { taskId }) {
   const touches = contextFiles.filter((f) => /^(src|lib)\//.test(f));
 
   // structured impl block: executed verbatim by the local backend
-  let impl = null;
-  const implMatch = IMPL_RE.exec(body);
-  if (implMatch) {
-    try {
-      const parsed = JSON.parse(implMatch[1]);
-      if (Array.isArray(parsed) && parsed.every((f) => f?.path && f?.content !== undefined)) impl = parsed;
-    } catch { /* malformed impl blocks are ignored, not fatal */ }
-  }
+  const impl = extractImpl(body);
 
   return {
     id: taskId,
@@ -76,7 +87,7 @@ export function enhanceSpec(issue, { taskId }) {
     touches,
     risk_tier: riskTier,
     conflicts_with: [],
-    impl,
+    impl: extractImpl(body),
     body_excerpt: body.slice(0, 600),
   };
 }

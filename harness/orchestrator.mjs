@@ -42,7 +42,18 @@ export class Orchestrator {
 
     this.backend = config.trueforgeUrl
       ? new TrueForgeBackend({ config, registry: this.skills })
-      : new LocalBackend({ github: this.github, sandbox: this.sandbox });
+      : new LocalBackend({
+          github: this.github,
+          sandbox: this.sandbox,
+          // the policy bridge the local backend requires: every write is a
+          // registry action routed through the engine — fail closed
+          authorize: (action, ctx) => {
+            const verdict = this.policy.decide(action, ctx);
+            return verdict.decision === 'auto'
+              ? { allowed: true }
+              : { allowed: false, reason: verdict.reason };
+          },
+        });
 
     this.spend = new SpendMeter({
       capUsd: config.spendCapUsd,
@@ -59,13 +70,14 @@ export class Orchestrator {
     this.reviewer = new ReviewStage({
       github: this.github, bus: this.bus, persist: (e) => this.store.persistEvent(e),
     });
+    this.reconciler = new Reconciler({
+      store: this.store, bus: this.bus, audit: this.audit, sandbox: this.sandbox,
+    });
     this.queue = new MergeQueue({
       store: this.store, bus: this.bus, gate: this.gate,
       github: this.github, sandbox: this.sandbox, spend: this.spend,
       reviewer: this.reviewer,
-    });
-    this.reconciler = new Reconciler({
-      store: this.store, bus: this.bus, audit: this.audit, sandbox: this.sandbox,
+      reconciler: this.reconciler, // main health is checked after every merge
     });
     this.planner = new Planner({ bus: this.bus, persist: (e) => this.store.persistEvent(e) });
   }
@@ -76,6 +88,11 @@ export class Orchestrator {
   }
 
   async stop() {
+    // release the durable merge lock before closing: a graceful shutdown
+    // must not make the next process wait out the TTL
+    try {
+      this.queue?.releaseLock();
+    } catch { /* store already closed */ }
     await this.github.close();
     this.store.close();
   }

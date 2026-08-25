@@ -39,6 +39,7 @@ const ACTIONS = Object.freeze({
   // T1 — reversible writes
   create_branch: TIERS.T1,
   push_branch: TIERS.T1,
+  commit_files: TIERS.T1, // commits land on a task branch, never main
   open_pr: TIERS.T1,
   comment: TIERS.T1,
   update_file: TIERS.T1,

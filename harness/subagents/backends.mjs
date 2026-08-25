@@ -128,7 +128,6 @@ export class TrueForgeBackend {
   }
 
   async awaitTurn(sessionId, turnId, { pollMs = 2000, maxMs = 600_000, signal } = {}) {
->>>>>>> a78ef27 (feat(orchestrator): wire skills registry, review stage, and run loop)
     const deadline = Date.now() + maxMs;
     for (;;) {
       if (signal?.aborted) throw new Error(`trueforge turn ${turnId} aborted`);

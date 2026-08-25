@@ -19,7 +19,6 @@
 
 import { Orchestrator } from './orchestrator.mjs';
 import { loadConfig } from './config.mjs';
-import { seedDemo } from '../scripts/seed.mjs';
 import { STATES } from './core/state.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -96,6 +95,9 @@ function printApprovalCase(a) {
 async function main() {
   switch (cmd) {
     case 'demo': {
+      // lazy import: the seed script is optional tooling and must never be a
+      // module-loading dependency of the CLI itself
+      const { seedDemo } = await import('../scripts/seed.mjs');
       await seedDemo(loadConfig(), { quiet: false });
       await withOrchestrator(async (orch) => {
         const s = await orch.runBacklog();
