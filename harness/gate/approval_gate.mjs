@@ -25,15 +25,21 @@ export class ApprovalGate {
     this.audit = audit;
     this.bus = bus;
     this.policy = policy;
-    this._seq = this._restoreSeq();
     this._onResolution = new Map(); // approvalId -> Set<fn>
   }
 
-  _restoreSeq() {
-    const last = this.store.listApprovals().at(0);
-    if (!last) return 0;
-    const m = /^appr-(\d+)$/.exec(last.id);
-    return m ? Number(m[1]) : 0;
+  /**
+   * Approval ids come from a persisted counter incremented inside a
+   * transaction — two harness processes sharing the database can never
+   * allocate the same id.
+   */
+  _nextSeq() {
+    return this.store._tx(() => {
+      const cur = Number(this.store.getMeta('approval.seq') ?? '0');
+      const next = cur + 1;
+      this.store.setMeta('approval.seq', String(next));
+      return next;
+    });
   }
 
   /**
@@ -60,7 +66,7 @@ export class ApprovalGate {
       return { id: null, tier: verdict.tier, auto: true, outcome: 'auto' };
     }
 
-    const id = `appr-${String(++this._seq).padStart(4, '0')}`;
+    const id = `appr-${String(this._nextSeq()).padStart(4, '0')}`;
     this.store.createApproval({
       id,
       taskId,
@@ -76,11 +82,21 @@ export class ApprovalGate {
     );
 
     const status = await this.waitFor(id);
+
+    // The human may have approved while the kill switch was engaged. The
+    // decision stands in the record, but execution fails closed until the
+    // switch is released.
+    if (status === 'approved' && this.policy.paused) {
+      return { id, tier: verdict.tier, auto: false, outcome: 'blocked' };
+    }
     return {
       id,
       tier: verdict.tier,
       auto: false,
-      outcome: status === 'approved' ? 'approved' : 'rejected',
+      outcome:
+        status === 'approved' ? 'approved'
+        : status === 'cancelled' ? 'cancelled'
+        : 'rejected',
     };
   }
 
@@ -112,19 +128,30 @@ export class ApprovalGate {
 
   cancel(id, reason = 'superseded') {
     const a = this.store.getApproval(id);
-    if (a && a.status === 'pending') {
-      this.store.decideApproval(id, { status: 'cancelled', decidedBy: 'system:gate', reason });
-      this.bus.emitEvent('approval.cancelled', { approvalId: id, reason }, (e) => this.store.persistEvent(e));
-    }
+    if (!a || a.status !== 'pending') return;
+    const updated = this.store.decideApproval(id, { status: 'cancelled', decidedBy: 'system:gate', reason });
+    if (!updated) return; // lost a race with a human decision — the human wins
+    // a cancellation is a durable state change: it gets an audit record too
+    this.audit.record({
+      actor: 'system:gate',
+      tier: a.tier,
+      action: a.action,
+      decision: 'cancelled',
+      reason,
+    });
+    this.bus.emitEvent('approval.cancelled', { approvalId: id, taskId: a.task_id, reason }, (e) => this.store.persistEvent(e));
   }
 
   async _resolve(id, status, actor, reason) {
     const a = this.store.getApproval(id);
     if (!a) throw new Error(`resolve: unknown approval ${id}`);
-    if (a.status !== 'pending') {
+    // Note: a human decision is always recordable, even mid-freeze — the
+    // kill switch gates EXECUTION, not the human. An approval granted while
+    // paused yields outcome 'blocked' below instead of running.
+    const updated = this.store.decideApproval(id, { status, decidedBy: actor, reason });
+    if (!updated) {
       throw new Error(`approval ${id} already ${a.status}`);
     }
-    this.store.decideApproval(id, { status, decidedBy: actor, reason });
     this.audit.record({
       actor,
       tier: a.tier,

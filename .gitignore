@@ -24,3 +24,10 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+data/
+demo-target/
+*.log
+session-*.md
+dbg-*.mjs
+.claude/

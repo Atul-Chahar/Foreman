@@ -124,6 +124,84 @@ test('gate: double-decide is refused', async () => {
   await w;
 });
 
+test('gate: under the kill switch, decisions are recorded but nothing executes', async () => {
+  const { gate } = rig();
+  const { policy } = gate;
+  const w = gate.request({ taskId: 'task-007', action: 'merge_to_main', summary: 'm' });
+  await sleep(50);
+  const [a] = gate.pending();
+
+  policy.engageKillSwitch('human:op', 'incident');
+  // NEW gated work is refused outright while frozen
+  await assert.rejects(
+    () => gate.request({ taskId: 'task-007', action: 'merge_to_main', summary: 'm2' }),
+    (e) => e.name === 'PolicyViolation',
+  );
+  // the human's decision on EXISTING work is still recordable...
+  await gate.approve(a.id, 'human:alice');
+  // ...but execution stays blocked until the switch is released
+  assert.equal((await w).outcome, 'blocked');
+
+  policy.releaseKillSwitch('human:op');
+});
+
+test('gate: an approval granted during the kill switch does not execute', async () => {
+  const { gate } = rig();
+  const { policy } = gate;
+  const w = gate.request({ taskId: 'task-007', action: 'merge_to_main', summary: 'm' });
+  await sleep(50);
+  const [a] = gate.pending();
+
+  policy.engageKillSwitch('human:op', 'incident');
+  await gate.approve(a.id, 'human:alice'); // decision recorded...
+  assert.equal((await w).outcome, 'blocked', '...but execution stays blocked');
+
+  policy.releaseKillSwitch('human:op');
+  assert.equal(gate.pending().length, 0);
+});
+
+test('gate: cancellation is audited and surfaces as cancelled — not rejected', async () => {
+  const { gate, store } = rig();
+  const w = gate.request({ taskId: 'task-007', action: 'open_pr', summary: 'pr' });
+  await sleep(50);
+  const [a] = gate.pending();
+  gate.cancel(a.id, 'superseded by task-008');
+  const outcome = await w;
+  assert.equal(outcome.outcome, 'cancelled');
+  const audit = store.listAudit(10);
+  assert.ok(audit.some((x) => x.decision === 'cancelled' && x.reason === 'superseded by task-008'));
+  store.close();
+});
+
+test('gate: approval ids never collide across harness restarts or instances', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'foreman-gate-seq-'));
+  const mkGate = () => {
+    const store = new Store(path.join(dir, 't.db'));
+    const bus = new EventBus();
+    return new ApprovalGate({
+      store, bus,
+      audit: new AuditLog(store, path.join(dir, 'a.log')),
+      policy: new PolicyEngine({ store, audit: new AuditLog(store, path.join(dir, 'a.log')), bus }),
+    });
+  };
+  const seen = new Set();
+  for (let round = 0; round < 3; round++) {
+    const gate = mkGate(); // fresh instance each round, same database
+    for (let n = 0; n < 3; n++) {
+      gate.store.createApproval({
+        id: `appr-${String(gate._nextSeq()).padStart(4, '0')}`,
+        taskId: 't', action: 'read_issue', tier: 'T2', summary: 'x',
+      });
+    }
+    for (const a of gate.pending()) {
+      assert.ok(!seen.has(a.id), `duplicate approval id ${a.id}`);
+      seen.add(a.id);
+      gate.cancel(a.id);
+    }
+  }
+  assert.equal(seen.size, 9);
+});
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }

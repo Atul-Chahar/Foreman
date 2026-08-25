@@ -6,7 +6,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+// This file lives at <root>/harness/config.mjs — one level up is the repo root.
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function loadDotEnv(file = path.join(ROOT, '.env')) {
   const out = {};
@@ -20,8 +21,12 @@ function loadDotEnv(file = path.join(ROOT, '.env')) {
   return out;
 }
 
-export function loadConfig(env = process.env) {
-  loadDotEnv();
+/**
+ * @param {NodeJS.ProcessEnv} env
+ * @param {{ dotenvFile?: string }} [opts] override the .env path (tests)
+ */
+export function loadConfig(env = process.env, opts = {}) {
+  loadDotEnv(opts.dotenvFile ?? path.join(ROOT, '.env'));
   const bool = (v, dflt) => (v === undefined || v === '' ? dflt : String(v).toLowerCase() === 'true');
   const int = (v, dflt) => (v === undefined || v === '' ? dflt : parseInt(v, 10));
 

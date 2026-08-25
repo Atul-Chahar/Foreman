@@ -105,26 +105,9 @@ export class Store {
     const now = new Date().toISOString();
     const existing = this.getTask(task.id);
     if (existing) {
-      this.db
-        .prepare(
-          `UPDATE tasks SET title=?, state=?, risk_tier=?, priority=?, branch=?, pr_number=?,
-             spec=?, result=?, attempts=?, kind=?, fix_for=?, updated_at=? WHERE id=?`,
-        )
-        .run(
-          task.title ?? existing.title,
-          task.state ?? existing.state,
-          task.risk_tier ?? existing.risk_tier,
-          task.priority ?? existing.priority,
-          task.branch ?? existing.branch,
-          task.pr_number ?? existing.pr_number,
-          JSON.stringify(task.spec ?? existing.spec),
-          JSON.stringify(task.result ?? existing.result),
-          task.attempts ?? existing.attempts,
-          task.kind ?? existing.kind,
-          task.fix_for ?? existing.fix_for,
-          now,
-          task.id,
-        );
+      // Deliberately does NOT write `state`: the state machine is only
+      // reachable through transitionTask(), which validates and audits.
+      this._updateTaskFields(existing, task, now);
       return this.getTask(task.id);
     }
     this.db
@@ -153,6 +136,31 @@ export class Store {
     return this.getTask(task.id);
   }
 
+  _updateTaskFields(existing, patch, now, forcedState = null) {
+    this.db
+      .prepare(
+        `UPDATE tasks SET title=?, state=?, risk_tier=?, priority=?, branch=?, pr_number=?,
+           spec=?, result=?, attempts=?, kind=?, fix_for=?, updated_at=? WHERE id=?`,
+      )
+      .run(
+        patch.title ?? existing.title,
+        // upsertTask can never move state; only transitionTask passes a
+        // validated forcedState
+        forcedState ?? existing.state,
+        patch.risk_tier ?? existing.risk_tier,
+        patch.priority ?? existing.priority,
+        patch.branch ?? existing.branch,
+        patch.pr_number ?? existing.pr_number,
+        JSON.stringify(patch.spec ?? existing.spec),
+        JSON.stringify(patch.result ?? existing.result),
+        patch.attempts ?? existing.attempts,
+        patch.kind ?? existing.kind,
+        patch.fix_for ?? existing.fix_for,
+        now,
+        existing.id,
+      );
+  }
+
   getTask(id) {
     const row = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
     return row ? this._taskFromRow(row) : null;
@@ -173,13 +181,43 @@ export class Store {
       .map((r) => this._taskFromRow(r));
   }
 
-  /** The ONLY way task state changes. Enforces the state machine. */
-  transitionTask(id, to, patch = {}) {
+  /**
+   * The ONLY way task state changes. Enforces the state machine and writes an
+   * audit record in the same transaction — a lifecycle change can never be
+   * silent or half-applied.
+   *
+   * @param {{ actor?: string, reason?: string }} [meta]
+   */
+  transitionTask(id, to, patch = {}, meta = {}) {
     const task = this.getTask(id);
     if (!task) throw new Error(`transitionTask: unknown task ${id}`);
     assertTransition(task.state, to);
-    this.upsertTask({ ...task, ...patch, id, state: to });
+    const from = task.state;
+    const now = new Date().toISOString();
+    this._tx(() => {
+      this._updateTaskFields(task, patch, now, to);
+      this.appendAudit({
+        actor: meta.actor ?? 'system:store',
+        tier: null,
+        action: 'task.transition',
+        decision: `${from} -> ${to}`,
+        reason: meta.reason ?? '',
+      });
+    });
     return this.getTask(id);
+  }
+
+  /** Run fn inside an immediate transaction; rolls back on throw. */
+  _tx(fn) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const out = fn();
+      this.db.exec('COMMIT');
+      return out;
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
   }
 
   _taskFromRow(row) {
@@ -215,12 +253,20 @@ export class Store {
     return rows.map((r) => ({ ...r, detail: JSON.parse(r.detail) }));
   }
 
+  /**
+   * Resolve a pending approval. Guarded: only a `pending` row can move, so a
+   * lost race (two deciders) leaves the first winner standing and returns
+   * null to the loser instead of silently overwriting the decision.
+   */
   decideApproval(id, { status, decidedBy, reason }) {
     const now = new Date().toISOString();
-    this.db
-      .prepare('UPDATE approvals SET status=?, decided_by=?, reason=?, decided_at=? WHERE id=?')
+    const info = this.db
+      .prepare(
+        `UPDATE approvals SET status=?, decided_by=?, reason=?, decided_at=?
+         WHERE id=? AND status='pending'`,
+      )
       .run(status, decidedBy, reason ?? null, now, id);
-    return this.getApproval(id);
+    return info.changes > 0 ? this.getApproval(id) : null;
   }
 
   // ── events ────────────────────────────────────────────────────────────────
@@ -232,12 +278,17 @@ export class Store {
   }
 
   listEvents(afterId = null, limit = 500) {
-    // Replay in insertion order; afterId enables incremental SSE catch-up.
+    // Replay in insertion order. The cursor is resolved in SQL so paging past
+    // any window size works — a LIMIT applied before the cursor would strand
+    // incremental consumers on the first page forever.
     const rows = this.db
-      .prepare('SELECT rowid, * FROM events ORDER BY rowid LIMIT ?')
-      .all(limit);
-    const idx = afterId ? rows.findIndex((r) => r.id === afterId) : -1;
-    return (idx >= 0 ? rows.slice(idx + 1) : rows).map((r) => ({
+      .prepare(
+        `SELECT rowid, * FROM events
+         WHERE (? IS NULL OR rowid > COALESCE((SELECT rowid FROM events WHERE id = ?), 0))
+         ORDER BY rowid LIMIT ?`,
+      )
+      .all(afterId, afterId, limit);
+    return rows.map((r) => ({
       id: r.id,
       ts: r.ts,
       type: r.type,
@@ -247,12 +298,14 @@ export class Store {
 
   // ── audit ─────────────────────────────────────────────────────────────────
 
+  /** Returns the stamped entry including its stable autoincrement id — the
+   *  join key that keeps SQLite and the JSONL evidence copy reconcilable. */
   appendAudit({ actor, tier, action, decision, reason }) {
     const ts = new Date().toISOString();
-    this.db
+    const info = this.db
       .prepare('INSERT INTO audit(ts, actor, tier, action, decision, reason) VALUES (?,?,?,?,?,?)')
       .run(ts, actor, tier ?? null, action, decision, reason ?? null);
-    return { ts, actor, tier, action, decision, reason };
+    return { id: Number(info.lastInsertRowid), ts, actor, tier, action, decision, reason };
   }
 
   listAudit(limit = 200) {
