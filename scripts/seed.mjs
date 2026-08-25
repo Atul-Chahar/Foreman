@@ -16,7 +16,12 @@ import path from 'node:path';
 import { loadConfig } from '../harness/config.mjs';
 import { LocalGitMCP } from '../harness/mcp_clients/local_git.mjs';
 
-const FAKE_TOKEN = 'ghp_' + 'FAKEFAKEFAKEFAKEFAKEFAKE1234'; // obvious dummy, never a real credential
+// Assembled from parts so no PAT-shaped literal exists in THIS repository's
+// source (our own scanners would flag it). At demo runtime the generated
+// webhook.mjs DOES contain a token-shaped dummy — deliberately: the seeded
+// "add webhook" task exists so the review stage visibly blocks a hardcoded
+// secret before any PR opens. It is never a real credential.
+const FAKE_TOKEN = ['ghp_', 'F'.repeat(24), '1234'].join('');
 
 const README = `# demo-target
 
@@ -90,7 +95,7 @@ function git(dir, args, { check = true } = {}) {
   return r;
 }
 
-const TEST_CMD = 'node --test test/main.test.mjs';
+const TEST_CMD = 'node --test'; // runs the whole suite, including tests the agents add
 
 /** The seeded backlog. Order matters only for readability. */
 function issues() {
@@ -356,9 +361,17 @@ export async function seedDemo(config = loadConfig(), { quiet = false, reset = f
   const mcp = new LocalGitMCP(targetDir, stateFile);
 
   const exists = fs.existsSync(path.join(targetDir, '.git'));
-  if (reset && exists) {
-    fs.rmSync(targetDir, { recursive: true, force: true });
+  if (reset) {
+    if (exists) fs.rmSync(targetDir, { recursive: true, force: true });
     if (fs.existsSync(stateFile)) fs.rmSync(stateFile);
+    // a fresh local issue tracker must not sit on top of stale task state:
+    // recreated issue numbers would silently map onto old tasks
+    const dbFile = path.join(config.dataDir, 'foreman.db');
+    for (const suffix of ['', '-wal', '-shm']) {
+      const f = `${dbFile}${suffix}`;
+      if (fs.existsSync(f)) fs.rmSync(f);
+    }
+    log(quiet, 'reset: target repo, localhub state and foreman task store wiped');
   }
 
   if (!fs.existsSync(path.join(targetDir, '.git'))) {
@@ -386,8 +399,10 @@ export async function seedDemo(config = loadConfig(), { quiet = false, reset = f
   }
 
   const seeded = (await mcp.callTool('list_issues')).length;
-  if (seeded > 0) {
-    log(quiet, `backlog already seeded (${seeded} open issues) — skipping`);
+  const closed = mcp._load().issues.filter((i) => i.state === 'closed').length;
+  const totalEver = mcp._load().issues.length;
+  if (seeded > 0 || (totalEver > 0 && closed > 0)) {
+    log(quiet, `backlog already seeded (${seeded} open, ${closed} closed) — skipping`);
     return { targetDir, issues: seeded };
   }
 
