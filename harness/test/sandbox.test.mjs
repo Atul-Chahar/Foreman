@@ -75,7 +75,7 @@ test('sandbox: hung test runs are killed by the hard timeout', async () => {
 
 test('sandbox: agent code cannot see orchestrator secrets', async () => {
   const dir = scratchRepo();
-  process.env.GITHUB_PERSONAL_ACCESS_TOKEN = 'ghp_supersecretvalue';
+  process.env.GITHUB_PERSONAL_ACCESS_TOKEN = 'example-token-for-scrubbing-check-not-a-real-credential';
   fs.writeFileSync(path.join(dir, 'test', 'env.test.mjs'),
     'import test from "node:test"; import assert from "node:assert/strict";\ntest("no secrets in sandbox", () => assert.equal(process.env.GITHUB_PERSONAL_ACCESS_TOKEN, undefined));\n');
   spawnSync('git', ['-C', dir, 'add', '.']);

@@ -93,7 +93,12 @@ export class SandboxRunner {
         FOREMAN_SANDBOX: '1',
       };
       const { bin, args } = this._resolveSpawn(parsed);
-      const child = spawn(bin, args, { cwd, env, windowsHide: true, shell: false });
+      // detached on posix => its own process group, so a timeout can kill
+      // the whole tree (test runners spawn children all the time)
+      const child = spawn(bin, args, {
+        cwd, env, windowsHide: true, shell: false,
+        detached: process.platform !== 'win32',
+      });
       let stdout = '';
       let stderr = '';
       let timedOut = false;
@@ -141,8 +146,17 @@ export class SandboxRunner {
   }
 
   async destroyWorktree(wt) {
-    if (!wt || !fs.existsSync(wt)) return;
-    spawnSync('git', ['-C', this.repoDir, 'worktree', 'remove', '--force', wt], { windowsHide: true });
+    if (!wt || !fs.existsSync(wt)) return true;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const r = spawnSync('git', ['-C', this.repoDir, 'worktree', 'remove', '--force', wt], {
+        encoding: 'utf8', windowsHide: true,
+      });
+      if (r.status === 0) return true;
+    }
+    // A leaked worktree holds a branch lock and disk forever — that must be
+    // loud, not silently swallowed.
+    console.error(`[sandbox] FAILED to remove worktree ${wt} — manual cleanup required`);
+    return false;
   }
 }
 
@@ -165,8 +179,29 @@ export function validateCommand({ bin, args }) {
   if (!ALLOWED_RUNNERS.includes(bin)) {
     return `runner '${bin}' is not on the sandbox allowlist (${ALLOWED_RUNNERS.join(', ')})`;
   }
-  if (bin === 'node' && !args.some((a) => a === '--test' || a.includes('.test.') || a === '.' || a.includes('test'))) {
-    return 'node commands in the sandbox must target tests';
+  // Per-runner shape checks: an allowlisted binary with arbitrary arguments
+  // is still arbitrary execution (node -e, npm exec, go run …).
+  if (bin === 'node') {
+    const evalish = args.some((a) => /^(-e|-p|--eval|--print)$/.test(a));
+    const testish = args.some((a) => a === '--test' || a.includes('.test.') || a.includes('test'));
+    if (evalish || !testish) return 'node commands in the sandbox must target tests';
+  }
+  if (['npm', 'pnpm', 'yarn'].includes(bin)) {
+    // only the project's own test script: "npm test" / "npm run test"
+    const ok =
+      (args[0] ?? '').toLowerCase() === 'test' ||
+      ((args[0] ?? '').toLowerCase() === 'run' && (args[1] ?? '').toLowerCase() === 'test');
+    if (!ok) return `${bin} in the sandbox may only run the project's test script`;
+  }
+  if (bin === 'bun' && (args[0] ?? '') !== 'test') {
+    return 'bun in the sandbox may only run "bun test"';
+  }
+  if (bin === 'go' && (args[0] ?? '') !== 'test') {
+    return 'go in the sandbox may only run "go test"';
+  }
+  if (['python', 'python3'].includes(bin)) {
+    const testish = args.some((a) => a.includes('test'));
+    if (!testish) return 'python commands in the sandbox must target tests';
   }
   const lowers = args.map((a) => a.toLowerCase());
   if (lowers.includes('rm') || lowers.includes('del') || lowers.includes('rmdir')) {
@@ -175,11 +210,17 @@ export function validateCommand({ bin, args }) {
   return null;
 }
 
-/** Kill a child and its descendants. taskkill /T on Windows, SIGKILL elsewhere. */
+/** Kill a child and its DESCENDANTS: SIGKILL to the process group on posix
+ *  (spawn used detached), taskkill /T on Windows. Killing only the immediate
+ *  runner would orphan whatever the runner spawned. */
 function killTree(child) {
   if (process.platform === 'win32') {
     spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
   } else {
-    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    try {
+      process.kill(-child.pid, 'SIGKILL'); // negative pid = the whole group
+    } catch {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    }
   }
 }

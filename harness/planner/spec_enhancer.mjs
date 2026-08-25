@@ -36,7 +36,7 @@ export function enhanceSpec(issue, { taskId }) {
     if (inCriteria || lines.some((l) => CRITERIA_RE.test(l))) {
       const m = /^\s*(?:[-*]|\[\s?[xX]?\])\s+(.{3,})$/.exec(line);
       if (m) criteria.push(m[1].trim());
-      else if (inCriteria && line.trim() === '') inCriteria = false;
+      else if (inCriteria && line.trim() !== '') inCriteria = false; // section ended
     }
   }
   if (criteria.length === 0) {
@@ -46,8 +46,9 @@ export function enhanceSpec(issue, { taskId }) {
     }
   }
 
-  // risk tier: anything mentioning main, deletion, or migration escalates
-  const risky = /merge to main|force.?push|delete|drop|destructive/i.test(body);
+  // risk tier: anything touching main history, deleting data, or migrating
+  // schema/state escalates — migrations are irreversible by nature
+  const risky = /merge to main|force.?push|delete|drop\b|destructive|migrat(?:e|ion)/i.test(body);
   const riskTier = risky ? 'T2' : 'T1';
 
   // files this task is expected to modify = context files under src/ or lib/
@@ -94,7 +95,10 @@ export class Planner {
 
     for (let i = 0; i < specs.length; i++) {
       for (let j = i + 1; j < specs.length; j++) {
-        const overlap = specs[i].touches.filter((f) => specs[j].touches.includes(f));
+        // conflict detection uses the FULL context_files set, not just the
+        // src/lib subset — two tasks editing the same README or config are
+        // exactly the ones that collide at merge time
+        const overlap = specs[i].context_files.filter((f) => specs[j].context_files.includes(f));
         if (overlap.length > 0) {
           specs[i].conflicts_with.push(specs[j].id);
           specs[j].conflicts_with.push(specs[i].id);
