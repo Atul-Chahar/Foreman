@@ -139,13 +139,17 @@ test('gate: under the kill switch, decisions are recorded but nothing executes',
   );
   // the human's decision on EXISTING work is still recordable...
   await gate.approve(a.id, 'human:alice');
-  // ...but execution stays blocked until the switch is released
-  assert.equal((await w).outcome, 'blocked');
+  // ...but execution holds until the switch is released
+  let settled = false;
+  void w.then(() => { settled = true; });
+  await sleep(80);
+  assert.equal(settled, false, 'approved work must not execute while frozen');
 
   policy.releaseKillSwitch('human:op');
+  assert.equal((await w).outcome, 'approved', 'work resumes once released');
 });
 
-test('gate: an approval granted during the kill switch does not execute', async () => {
+test('gate: an approval granted during the kill switch executes after release', async () => {
   const { gate } = rig();
   const { policy } = gate;
   const w = gate.request({ taskId: 'task-007', action: 'merge_to_main', summary: 'm' });
@@ -154,10 +158,15 @@ test('gate: an approval granted during the kill switch does not execute', async 
 
   policy.engageKillSwitch('human:op', 'incident');
   await gate.approve(a.id, 'human:alice'); // decision recorded...
-  assert.equal((await w).outcome, 'blocked', '...but execution stays blocked');
+  await sleep(80);
+  assert.equal(gate.pending().length, 0);
+  let settled = false;
+  void w.then(() => { settled = true; });
+  await sleep(80);
+  assert.equal(settled, false, 'execution holds while frozen');
 
   policy.releaseKillSwitch('human:op');
-  assert.equal(gate.pending().length, 0);
+  assert.equal((await w).outcome, 'approved', 'held approval resumes once released');
 });
 
 test('gate: cancellation is audited and surfaces as cancelled — not rejected', async () => {

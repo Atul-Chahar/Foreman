@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../config.mjs';
@@ -35,6 +37,30 @@ test('config: explicit env wins over defaults', () => {
   assert.equal(cfg.maxConcurrency, 3);
   assert.equal(cfg.trueforgeUrl, 'http://localhost:8790');
   assert.equal(cfg.targetLocal, '/tmp/target');
+});
+
+test('config: dotenv values reach the returned config; explicit env wins', () => {
+  fs.mkdirSync(os.tmpdir(), { recursive: true });
+  const dot = path.join(os.tmpdir(), `foreman-env-${Date.now()}`);
+  fs.writeFileSync(dot, 'FOREMAN_MAX_CONCURRENCY=5\nFOREMAN_T1_AUTO=true\n');
+  const savedConcurrency = process.env.FOREMAN_MAX_CONCURRENCY;
+  const savedT1 = process.env.FOREMAN_T1_AUTO;
+  try {
+    const cfg = loadConfig({}, { dotenvFile: dot });
+    assert.equal(cfg.maxConcurrency, 5, '.env value used when env is silent');
+    assert.equal(cfg.t1Auto, true);
+
+    const overridden = loadConfig({ FOREMAN_MAX_CONCURRENCY: '2' }, { dotenvFile: dot });
+    assert.equal(overridden.maxConcurrency, 2, 'explicit env beats .env');
+  } finally {
+    // loadConfig exports missing keys to process.env for child processes;
+    // restore them so other tests stay hermetic
+    if (savedConcurrency === undefined) delete process.env.FOREMAN_MAX_CONCURRENCY;
+    else process.env.FOREMAN_MAX_CONCURRENCY = savedConcurrency;
+    if (savedT1 === undefined) delete process.env.FOREMAN_T1_AUTO;
+    else process.env.FOREMAN_T1_AUTO = savedT1;
+    fs.rmSync(dot);
+  }
 });
 
 test('config: T2 is not configurable anywhere in the config surface', () => {

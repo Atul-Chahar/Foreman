@@ -155,6 +155,32 @@ test('audit: jsonl gaps are repaired from sqlite by stable id', () => {
   store.close();
 });
 
+test('audit: task transitions land in the jsonl evidence copy too', () => {
+  const { dir, store } = tmpStore();
+  const file = path.join(dir, 'audit.log');
+  new AuditLog(store, file); // registers the sink
+  store.upsertTask({ id: 'task-001', title: 'x' });
+  store.transitionTask('task-001', STATES.DISPATCHED);
+  const lines = fs.readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.ok(lines.some((l) => l.action === 'task.transition' && /planned -> dispatched/.test(l.decision)));
+  store.close();
+});
+
+test('audit: torn final line triggers a full rebuild — file stays valid jsonl', () => {
+  const { dir, store } = tmpStore();
+  const file = path.join(dir, 'audit.log');
+  const log = new AuditLog(store, file);
+  log.record({ actor: 'a', action: 'x1', decision: 'd' });
+  log.record({ actor: 'b', action: 'x2', decision: 'd' });
+  // simulate a crash mid-append: valid line + unterminated fragment
+  fs.appendFileSync(file, '{"id":99,"actor":"c"');
+  log.syncFromDb();
+  const lines = fs.readFileSync(file, 'utf8').trim().split('\n');
+  for (const line of lines) assert.doesNotThrow(() => JSON.parse(line));
+  assert.equal(lines.length, 2, 'rebuild restores exactly the db rows');
+  store.close();
+});
+
 test('ids: task <-> branch mapping round-trips', () => {
   assert.equal(branchForTask('task-007'), 'foreman/task-007');
   assert.equal(taskForBranch('foreman/task-007'), 'task-007');

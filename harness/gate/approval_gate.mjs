@@ -48,7 +48,7 @@ export class ApprovalGate {
    * approval and waits — possibly forever, possibly across a restart —
    * for a human decision.
    *
-   * @returns {{ id: string|null, tier: string, auto: boolean, outcome: 'auto'|'approved'|'rejected'|'blocked' }}
+   * @returns {{ id: string|null, tier: string, auto: boolean, outcome: 'auto'|'approved'|'rejected'|'cancelled' }}
    */
   async request({ taskId, action, summary, detail = {} }) {
     const verdict = this.policy.decide(action, { taskId });
@@ -83,11 +83,10 @@ export class ApprovalGate {
 
     const status = await this.waitFor(id);
 
-    // The human may have approved while the kill switch was engaged. The
-    // decision stands in the record, but execution fails closed until the
-    // switch is released.
-    if (status === 'approved' && this.policy.paused) {
-      return { id, tier: verdict.tier, auto: false, outcome: 'blocked' };
+    // A yes given while the kill switch is engaged is recorded but held:
+    // execution waits for release rather than dying as 'blocked' forever.
+    if (status === 'approved') {
+      while (this.policy.paused) await sleep(POLL_MS);
     }
     return {
       id,

@@ -73,6 +73,7 @@ export class Store {
   constructor(file) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     this.db = new DatabaseSync(file);
+    this.auditSink = null; // set by AuditLog: (row) => void — writes the JSONL copy
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec(DDL);
     this.db
@@ -189,12 +190,14 @@ export class Store {
    * @param {{ actor?: string, reason?: string }} [meta]
    */
   transitionTask(id, to, patch = {}, meta = {}) {
-    const task = this.getTask(id);
-    if (!task) throw new Error(`transitionTask: unknown task ${id}`);
-    assertTransition(task.state, to);
-    const from = task.state;
     const now = new Date().toISOString();
+    // Read, validate, write and audit INSIDE the write lock: two concurrent
+    // callers must not both validate against the same stale source state.
     this._tx(() => {
+      const task = this.getTask(id);
+      if (!task) throw new Error(`transitionTask: unknown task ${id}`);
+      const from = task.state;
+      assertTransition(from, to);
       this._updateTaskFields(task, patch, now, to);
       this.appendAudit({
         actor: meta.actor ?? 'system:store',
@@ -299,18 +302,38 @@ export class Store {
   // ── audit ─────────────────────────────────────────────────────────────────
 
   /** Returns the stamped entry including its stable autoincrement id — the
-   *  join key that keeps SQLite and the JSONL evidence copy reconcilable. */
+   *  join key that keeps SQLite and the JSONL evidence copy reconcilable.
+   *  If an AuditLog has registered itself as `auditSink`, the JSONL copy is
+   *  written here too: one write path, no divergence by construction. */
   appendAudit({ actor, tier, action, decision, reason }) {
     const ts = new Date().toISOString();
     const info = this.db
       .prepare('INSERT INTO audit(ts, actor, tier, action, decision, reason) VALUES (?,?,?,?,?,?)')
       .run(ts, actor, tier ?? null, action, decision, reason ?? null);
-    return { id: Number(info.lastInsertRowid), ts, actor, tier, action, decision, reason };
+    const entry = { id: Number(info.lastInsertRowid), ts, actor, tier, action, decision, reason };
+    if (this.auditSink) {
+      // The database row is authoritative; a failed evidence append must not
+      // lose or roll back the decision. syncFromDb() repairs the gap by id.
+      try {
+        this.auditSink(entry);
+      } catch (err) {
+        console.error(`[audit] jsonl append failed (db id=${entry.id}):`, err.message);
+      }
+    }
+    return entry;
   }
 
   listAudit(limit = 200) {
     return this.db
       .prepare('SELECT * FROM audit ORDER BY id DESC LIMIT ?')
       .all(limit);
+  }
+
+  /** Ascending keyset page of audit rows after `afterId` — lets the JSONL
+   *  evidence log repair from any point without missing interior rows. */
+  listAuditAfter(afterId = -1, limit = 1000) {
+    return this.db
+      .prepare('SELECT * FROM audit WHERE id > ? ORDER BY id LIMIT ?')
+      .all(afterId, limit);
   }
 }
