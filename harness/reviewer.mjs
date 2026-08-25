@@ -17,7 +17,7 @@ const SECRET_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,          // pem private key block
 ];
 
-const MAX_FILE_BYTES = 100_000; // large/binary-ish files are skipped
+const MAX_SCAN_BYTES = 1_000_000; // hard cap on any single file read for review
 
 export class ReviewStage {
   /**
@@ -34,8 +34,10 @@ export class ReviewStage {
 
   /**
    * Review a task's branch. Returns { ok, findings, files }.
-   * `ok` is false iff any blocking finding fired. Never throws — a review
-   * crash degrades to a warning-only result so the queue cannot wedge.
+   * `ok` is false iff any blocking finding fired. A review crash fails
+   * CLOSED: the task stops at needs_human with the error attached rather
+   * than sailing past every check because the reviewer hiccuped. The queue
+   * still moves on — fail closed, never wedge.
    */
   async run({ task }) {
     try {
@@ -45,9 +47,9 @@ export class ReviewStage {
         taskId: task.id, error: err.message,
       }, this.persist);
       return {
-        ok: true,
+        ok: false,
         degraded: true,
-        findings: [{ severity: 'warning', file: null, rule: 'review-crashed', message: `review stage failed (${err.message}); heuristics skipped` }],
+        findings: [{ severity: 'blocking', file: null, rule: 'review-crashed', message: `review stage failed (${err.message}); treat as unreviewed` }],
         files: [],
       };
     }
@@ -73,7 +75,19 @@ export class ReviewStage {
       if (f.path.endsWith('.lock') || f.path.includes('node_modules/')) continue;
       try {
         const text = await this.github.readFileAtRef(branch, f.path);
-        if (text !== null && text.length <= MAX_FILE_BYTES) contents.set(f.path, text);
+        // Secret scanning must not be bypassable by file size: readable
+        // files are scanned whatever their length; only truly huge reads
+        // are capped, and a capped read is recorded as such.
+        if (text === null) continue;
+        if (text.length > MAX_SCAN_BYTES) {
+          contents.set(f.path, text.slice(0, MAX_SCAN_BYTES));
+          findings.push({
+            severity: 'warning', file: f.path, rule: 'file-truncated-in-review',
+            message: `file exceeds ${MAX_SCAN_BYTES} bytes — secrets scan covered the first ${MAX_SCAN_BYTES}`,
+          });
+        } else {
+          contents.set(f.path, text);
+        }
       } catch { /* unreadable files are skipped, not fatal */ }
     }
 
@@ -89,21 +103,11 @@ export class ReviewStage {
       }
     }
 
-    // 2) dynamic execution and injection — added lines only
+    // 2) dynamic execution and injection — added lines only, with REAL
+    // new-file line numbers from the hunk headers
     for (const [file, lines] of addedLinesByFile) {
-      for (const [i, line] of lines.entries()) {
-        if (/\beval\s*\(|new\s+Function\s*\(/.test(line)) {
-          findings.push({
-            severity: 'blocking', file, rule: 'dynamic-execution', line: i + 1,
-            message: `eval/new Function on line ${i + 1}: ${line.trim().slice(0, 120)}`,
-          });
-        }
-        if (/child_process|execSync|spawnSync/.test(line) && /\$\{|\+ *\w|["'`].*\w+ *["']\s*\+/.test(line)) {
-          findings.push({
-            severity: 'blocking', file, rule: 'command-injection', line: i + 1,
-            message: `command built from interpolated values on line ${i + 1}: ${line.trim().slice(0, 120)}`,
-          });
-        }
+      for (const finding of scanAddedLines(file, lines)) {
+        findings.push(finding);
       }
     }
 
@@ -138,7 +142,7 @@ export class ReviewStage {
       }
     }
     for (const [file, lines] of addedLinesByFile) {
-      if (lines.some((l) => /\b(TODO|FIXME|XXX)\b/.test(l))) {
+      if (lines.some((l) => /\b(TODO|FIXME|XXX)\b/.test(l.text))) {
         findings.push({
           severity: 'warning', file, rule: 'todo-left',
           message: 'TODO/FIXME introduced in the diff',
@@ -156,39 +160,103 @@ export class ReviewStage {
   }
 }
 
-/** Files touched by a diff, with add/modify/delete status. */
-export function parseChangedFiles(diff) {
+/** exec-ish calls; interpolation into one of these is how command
+ *  injection actually happens. */
+const EXEC_RE = /\b(?:child_process|execSync|spawnSync|exec\s*\()/;
+/** template-literal interpolation */
+const INTERP_RE = /\$\{[^}]*\}/;
+
+/** Injection heuristics over a file's added lines. Precision-first: plain
+ *  string concatenation of static parts is NOT flagged — false positives
+ *  here stall a parallel swarm. */
+export function scanAddedLines(file, lines) {
   const out = [];
-  let current = null;
-  for (const line of String(diff).split(/\r?\n/)) {
-    const m = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
-    if (m) {
-      current = { path: m[2], status: 'modified' };
-      out.push(current);
-      continue;
+  for (const { n, text: line } of lines) {
+    if (/\beval\s*\(|new\s+Function\s*\(/.test(line)) {
+      out.push({
+        severity: 'blocking', file, rule: 'dynamic-execution', line: n,
+        message: `eval/new Function on line ${n}: ${line.trim().slice(0, 120)}`,
+      });
     }
-    if (current) {
-      if (/^new file mode /.test(line)) current.status = 'added';
-      if (/^deleted file mode /.test(line)) current.status = 'deleted';
+    if (EXEC_RE.test(line) && INTERP_RE.test(line)) {
+      out.push({
+        severity: 'blocking', file, rule: 'command-injection', line: n,
+        message: `command composed with interpolated values on line ${n}: ${line.trim().slice(0, 120)}`,
+      });
     }
   }
   return out;
 }
 
-/** Added lines per file from a unified diff: Map<file, string[]>. */
+/**
+ * Files touched by a diff, with add/modify/delete status.
+ * Handles quoted headers (`diff --git "a/pa th" "b/pa th"`) emitted for
+ * paths with spaces/special chars, and classifies a file as ADDED when its
+ * first hunk starts at -0,0 (works even when the backend's diff omits
+ * explicit "new file mode" markers).
+ */
+export function parseChangedFiles(diff) {
+  const out = [];
+  let current = null;
+  let sawNewFileMarker = false;
+  for (const line of String(diff).split(/\r?\n/)) {
+    const m = DIFF_HEADER_RE.exec(line);
+    if (m) {
+      current = { path: unquotePath(m[1] ?? m[2]), status: 'modified' };
+      sawNewFileMarker = false;
+      out.push(current);
+      continue;
+    }
+    if (!current) continue;
+    if (/^new file mode /.test(line)) current.status = 'added';
+    else if (/^deleted file mode /.test(line)) current.status = 'deleted';
+    else if (!sawNewFileMarker && /^@@ -0,0 \+\d+,\d+ @@|^@@ -0,0 \+@@/.test(line)) {
+      // every hunk line is an addition starting at line 1 => brand-new file
+      if (current.status === 'modified') current.status = 'added';
+      sawNewFileMarker = true;
+    }
+  }
+  return out;
+}
+
+const DIFF_HEADER_RE = /^diff --git (?:"a\/(.+)"|a\/(.+?)) (?:"b\/(.+)"|b\/(.+))$/;
+
+/** git quotes unusual paths ("a/with space") and C-escapes them. */
+function unquotePath(p) {
+  if (p === undefined || p === null) return '';
+  return p.replace(/\\(["\\nt])/g, (_, c) => (c === 'n' ? '\n' : c === 't' ? '\t' : c));
+}
+
+/**
+ * Added lines per file from a unified diff: Map<file, Array<{n, text}>>.
+ * `n` is the line number in the NEW file, tracked through @@ hunk headers.
+ */
 export function addedLines(diff) {
   const byFile = new Map();
   let file = null;
+  let n = 0;
   for (const line of String(diff).split(/\r?\n/)) {
-    const m = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+    const m = DIFF_HEADER_RE.exec(line);
     if (m) {
-      file = m[2];
+      file = unquotePath(m[1] ?? m[2]);
       byFile.set(file, byFile.get(file) ?? []);
       continue;
     }
     if (file === null) continue;
-    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) continue;
-    if (line.startsWith('+')) byFile.get(file).push(line.slice(1));
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (hunk) {
+      n = Number(hunk[1]);
+      continue;
+    }
+    if (line.startsWith('---') || line.startsWith('+++')) continue;
+    if (line.startsWith('+')) {
+      byFile.get(file).push({ n, text: line.slice(1) });
+      n += 1;
+    } else if (line.startsWith('-')) {
+      // deletion: does not advance the new-file cursor
+    } else {
+      n += 1; // context line
+    }
   }
   return byFile;
 }

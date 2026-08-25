@@ -99,17 +99,15 @@ export class MergeQueue {
     const branch = task.branch;
     const result = task.result ?? {};
 
-    // review BEFORE any PR: blocking findings stop the task, no PR opens
+    // review BEFORE any PR: blocking findings stop the task, no PR opens.
+    // (the reviewer emits review.passed/blocked itself — the queue only
+    // persists the decision, it does not duplicate the event)
     if (this.reviewer && result.review === undefined) {
       const review = await this.reviewer.run({ task });
       if (!review.ok) {
         this.store.transitionTask(task.id, STATES.NEEDS_HUMAN, {
           result: { ...result, review },
         });
-        this.bus.emitEvent('review.blocked', {
-          taskId: task.id,
-          blocking: review.findings.filter((f) => f.severity === 'blocking').map((f) => `${f.rule}(${f.file})`),
-        }, (e) => this.store.persistEvent(e));
         return; // queue keeps moving; one blocked task never stalls it
       }
       result.review = review;

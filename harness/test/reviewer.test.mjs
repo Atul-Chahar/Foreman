@@ -12,7 +12,7 @@ import { ApprovalGate } from '../gate/approval_gate.mjs';
 import { SandboxRunner } from '../sandbox_runner.mjs';
 import { GitHubMCP } from '../mcp_clients/github.mjs';
 import { MergeQueue } from '../merge_queue.mjs';
-import { ReviewStage, parseChangedFiles, addedLines } from '../reviewer.mjs';
+import { ReviewStage, parseChangedFiles, addedLines, scanAddedLines } from '../reviewer.mjs';
 import { STATES } from '../core/state.mjs';
 
 function scratchTarget() {
@@ -145,14 +145,14 @@ test('merge queue: passing review attaches findings to the T2 approval detail', 
   await processing;
 });
 
-test('reviewer: a crash degrades to warning-only and never wedges the queue', async () => {
+test('reviewer: a crash fails closed — blocking, never a silent pass', async () => {
   const r = rig();
   makeBranch(r.target, 'task-crash', { 'src/fine.mjs': 'export const ok = true;\n' });
   r.github.getBranchDiff = async () => { throw new Error('diff backend down'); };
   const review = await r.reviewer.run({ task: { ...taskFor('task-crash', ['src/fine.mjs']), branch: 'foreman/task-crash' } });
-  assert.equal(review.ok, true);
+  assert.equal(review.ok, false, 'an unreviewable branch must not pass review');
   assert.equal(review.degraded, true);
-  assert.ok(review.findings.some((f) => f.rule === 'review-crashed'));
+  assert.ok(review.findings.some((f) => f.rule === 'review-crashed' && f.severity === 'blocking'));
 });
 
 test('diff parsing: statuses and added lines extract correctly', () => {
@@ -177,6 +177,39 @@ test('diff parsing: statuses and added lines extract correctly', () => {
     ['src/new.mjs', 'added'],
   ]);
   const added = addedLines(diff);
-  assert.deepEqual(added.get('src/a.mjs'), ['const added = 2;']);
-  assert.deepEqual(added.get('src/new.mjs'), ['export const n = 1;']);
+  assert.deepEqual(added.get('src/a.mjs'), [{ n: 2, text: 'const added = 2;' }]);
+  assert.deepEqual(added.get('src/new.mjs'), [{ n: 1, text: 'export const n = 1;' }]);
 });
+
+test('diff parsing: quoted headers and remote synthesized diffs classify correctly', () => {
+  // remote backends (GitHub compare API) emit no "new file mode" marker
+  const remoteDiff = [
+    'diff --git "a/src/with space.mjs" "b/src/with space.mjs"',
+    '--- /dev/null',
+    '+++ b/src/with space.mjs',
+    '@@ -0,0 +1,2 @@',
+    '+export const q = 1;',
+    '+export const w = 2;',
+  ].join('\n');
+  const changed = parseChangedFiles(remoteDiff);
+  assert.deepEqual(changed.map((c) => [c.path, c.status]), [
+    ['src/with space.mjs', 'added'],
+  ]);
+  const lines = addedLines(remoteDiff).get('src/with space.mjs');
+  assert.deepEqual(lines.map((l) => l.n), [1, 2], 'new-file line numbers come from the hunk header');
+});
+
+test('reviewer: command-injection heuristic ignores static concatenation but flags interpolation', () => {
+  const diff = [
+    'diff --git a/src/run.mjs b/src/run.mjs',
+    '--- a/src/run.mjs',
+    '+++ b/src/run.mjs',
+    '@@ -1,2 +1,4 @@',
+    "+exec('git ' + subcommand);", // static concat: NOT flagged
+    '+const cmd = build();', // no exec: NOT flagged
+    '+exec(`ls ${userPath}`);', // interpolation into exec: flagged
+  ].join('\n');
+  const findings = scanAddedLines('src/run.mjs', addedLines(diff).get('src/run.mjs'));
+  assert.deepEqual(findings.map((f) => f.line), [3], 'interpolation into exec flags; static concat does not');
+});
+
