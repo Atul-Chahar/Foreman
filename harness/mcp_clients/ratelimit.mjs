@@ -38,23 +38,35 @@ export class RateLimiter {
     this._last = now;
   }
 
-  /** Run fn with a token; retry on rate-limit style rejections. */
+  /**
+   * Run fn with a token; retry on rate-limit indications and transient
+   * transport failures. The concurrency slot is released between attempts —
+   * sleeping callers must not count as in-flight work.
+   */
   async run(fn) {
     let lastErr;
     for (let attempt = 0; attempt < this.maxAttempts; attempt++) {
       await this.acquire();
+      let outcome;
       try {
-        return await fn(attempt);
+        outcome = { ok: true, value: await fn(attempt) };
       } catch (err) {
-        lastErr = err;
-        if (!this._isRateLimit(err)) throw err;
-        const waitMs = this._retryAfterMs(err) ?? 2 ** attempt * 1000;
-        await sleep(waitMs);
+        outcome = { ok: false, err };
       } finally {
         this._release();
       }
+      if (outcome.ok) return outcome.value;
+      lastErr = outcome.err;
+      if (!this._shouldRetry(outcome.err)) throw outcome.err;
+      // backoff happens OUTSIDE the slot
+      const waitMs = this._retryAfterMs(outcome.err) ?? 2 ** attempt * 1000;
+      await sleep(waitMs);
     }
     throw lastErr;
+  }
+
+  _shouldRetry(err) {
+    return this._isRateLimit(err) || err?.code === 'MCP_TRANSPORT';
   }
 
   _isRateLimit(err) {

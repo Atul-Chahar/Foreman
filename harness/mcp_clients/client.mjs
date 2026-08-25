@@ -7,6 +7,16 @@
 
 import { spawn } from 'node:child_process';
 
+/** Transport-level failure (spawn, exit, timeout). Retryable by the rate
+ *  limiter; distinct from tool errors (isError), which are never retried. */
+export class MCPTransportError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'MCPTransportError';
+    this.code = 'MCP_TRANSPORT';
+  }
+}
+
 export class MCPClient {
   /**
    * @param {object} opts
@@ -14,12 +24,14 @@ export class MCPClient {
    * @param {string[]} [opts.args]
    * @param {Record<string,string>} [opts.env] extra env for the server process
    * @param {number} [opts.callTimeoutMs] per tools/call timeout
+   * @param {number} [opts.initTimeoutMs] budget for the initialize handshake
    */
-  constructor({ command, args = [], env = {}, callTimeoutMs = 60_000 }) {
+  constructor({ command, args = [], env = {}, callTimeoutMs = 60_000, initTimeoutMs = 15_000 }) {
     this.command = command;
     this.args = args;
     this.env = env;
     this.callTimeoutMs = callTimeoutMs;
+    this.initTimeoutMs = initTimeoutMs;
     this._seq = 0;
     this._pending = new Map(); // id -> {resolve, reject, timer}
     this._buffer = '';
@@ -31,21 +43,46 @@ export class MCPClient {
   }
 
   async connect() {
-    this._proc = spawn(this.command, this.args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ...this.env },
+    let proc;
+    try {
+      proc = spawn(this.command, this.args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, ...this.env },
+      });
+    } catch (err) {
+      throw new MCPTransportError(`MCP server spawn failed: ${err.message}`);
+    }
+    // Registered before anything else: a spawn failure emits 'error' and an
+    // unhandled one would crash the whole harness process.
+    proc.on('error', (err) => {
+      this._rejectAll(new MCPTransportError(`MCP server failed: ${err.message}`));
     });
-    this._proc.stdout.on('data', (d) => this._onStdout(d));
-    this._proc.stderr.on('data', (d) => process.stderr.write(`[mcp] ${d}`));
-    this._proc.on('exit', (code) => this._rejectAll(new Error(`MCP server exited (${code})`)));
+    this._proc = proc;
+    proc.stdout.on('data', (d) => this._onStdout(d));
+    proc.stderr.on('data', (d) => process.stderr.write(`[mcp] ${d}`));
+    proc.on('exit', (code) => {
+      this._proc = null;
+      this._rejectAll(new MCPTransportError(`MCP server exited (${code})`));
+    });
 
-    const result = await this._rpc('initialize', {
-      protocolVersion: '2024-11-05',
-      capabilities: {},
-      clientInfo: { name: 'foreman', version: '0.1.0' },
-    });
-    this._notify('notifications/initialized');
-    return result;
+    try {
+      const result = await this._rpc(
+        'initialize',
+        {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'foreman', version: '0.1.0' },
+        },
+        this.initTimeoutMs,
+      );
+      this._notify('notifications/initialized');
+      return result;
+    } catch (err) {
+      // failed handshake — never leak the child process
+      await this.close();
+      this._proc = null;
+      throw err;
+    }
   }
 
   async listTools() {
@@ -115,16 +152,16 @@ export class MCPClient {
     this._pending.clear();
   }
 
-  _rpc(method, params) {
+  _rpc(method, params, timeoutMs = this.callTimeoutMs) {
     const id = ++this._seq;
     return new Promise((resolve, reject) => {
-      if (!this.connected) return reject(new Error('MCP server not connected'));
+      if (!this.connected) return reject(new MCPTransportError('MCP server not connected'));
       const timer = setTimeout(
         () => {
           this._pending.delete(id);
-          reject(new Error(`MCP ${method} timed out after ${this.callTimeoutMs}ms`));
+          reject(new MCPTransportError(`MCP ${method} timed out after ${timeoutMs}ms`));
         },
-        this.callTimeoutMs,
+        timeoutMs,
       );
       this._pending.set(id, { resolve, reject, timer });
       this._send({ jsonrpc: '2.0', id, method, params });

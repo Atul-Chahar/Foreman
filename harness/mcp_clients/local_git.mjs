@@ -92,7 +92,7 @@ export class LocalGitMCP {
   async commit_files({ branch, files, message }) {
     this._git(['checkout', branch]);
     for (const f of files) {
-      const abs = path.join(this.repoDir, f.path);
+      const abs = this._safePath(f.path);
       fs.mkdirSync(path.dirname(abs), { recursive: true });
       fs.writeFileSync(abs, f.content);
       this._git(['add', f.path]);
@@ -101,6 +101,49 @@ export class LocalGitMCP {
     this._git(['checkout', 'main']);
     const head = this._git(['rev-parse', branch]).stdout.trim();
     return { branch, head, committed: files.length };
+  }
+
+  /**
+   * Resolve an agent-supplied path against the repo root, refusing anything
+   * that could write outside the tree: absolute paths, `..` traversal, or a
+   * symlinked directory pointing elsewhere.
+   */
+  _safePath(p) {
+    if (typeof p !== 'string' || p.length === 0 || path.isAbsolute(p)) {
+      throw new Error(`invalid repo path: ${JSON.stringify(p)}`);
+    }
+    const root = path.resolve(this.repoDir);
+    const abs = path.resolve(root, p);
+    const rel = path.relative(root, abs);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`repo path escapes repository: ${p}`);
+    }
+    // Walk every component with lstat: a symlink anywhere along the route
+    // (even a dangling one, which existsSync silently ignores) could redirect
+    // the write outside the tree.
+    let cur = root;
+    for (const part of rel.split(path.sep)) {
+      cur = path.join(cur, part);
+      let st;
+      try {
+        st = fs.lstatSync(cur);
+      } catch {
+        continue; // component doesn't exist yet — nothing to follow
+      }
+      if (st.isSymbolicLink()) {
+        let real;
+        try {
+          real = fs.realpathSync(cur);
+        } catch {
+          // dangling symlink: target missing, destination unknowable — refuse
+          throw new Error(`repo path escapes repository through symlink: ${p}`);
+        }
+        if (real !== root && !real.startsWith(root + path.sep)) {
+          throw new Error(`repo path escapes repository through symlink: ${p}`);
+        }
+      }
+    }
+    return abs;
   }
 
   async create_pull_request({ branch, title, body = '', base = 'main' }) {
@@ -130,14 +173,14 @@ export class LocalGitMCP {
   async get_pull_request_diff({ number }) {
     const pr = this._load().prs.find((p) => p.number === Number(number));
     if (!pr) throw new Error(`PR #${number} not found`);
-    const r = this._git(['diff', `${pr.base}...${pr.branch}`], { allowFail: true });
-    return r.stdout;
+    // Fail closed: the review stage must never read a git error as "no
+    // changes". A broken diff is an exception, not an empty string.
+    return this._git(['diff', `${pr.base}...${pr.branch}`]).stdout;
   }
 
   /** Diff a branch against base without needing a PR. Review runs pre-PR. */
   async get_branch_diff({ branch, base = 'main' }) {
-    const r = this._git(['diff', `${base}...${branch}`], { allowFail: true });
-    return r.stdout;
+    return this._git(['diff', `${base}...${branch}`]).stdout;
   }
 
   /** File contents at a branch ref; null when the file does not exist there. */

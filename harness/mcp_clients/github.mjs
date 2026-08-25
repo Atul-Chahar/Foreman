@@ -92,12 +92,35 @@ export class GitHubMCP {
     });
   }
 
-  /** The GitHub MCP server names some args differently than our tool surface. */
+  /** The official GitHub MCP server schemas differ from our internal tool
+   *  surface: repository identity is injected, and field names are mapped
+   *  (branch->head, number->pullNumber/issue_number, etc). */
   _translateArgs(tool, args) {
-    if (tool === 'read_file_at_ref') {
-      return { owner: this.owner, repo: this.repo, path: args.path, ref: args.branch };
+    const base = { owner: this.owner, repo: this.repo };
+    switch (tool) {
+      case 'read_file_at_ref':
+        return { ...base, path: args.path, ref: args.branch };
+      case 'create_pull_request':
+        return { ...base, head: args.branch, base: args.base ?? 'main', title: args.title, body: args.body ?? '' };
+      case 'get_pull_request':
+        return { ...base, pullNumber: Number(args.number) };
+      case 'get_pull_request_diff':
+        return { ...base, pullNumber: Number(args.number) };
+      case 'merge_pull_request':
+        return { ...base, pullNumber: Number(args.number), merge_method: 'merge' };
+      case 'list_issues':
+        return { ...base, state: 'open' };
+      case 'get_issue':
+        return { ...base, issue_number: Number(args.number) };
+      case 'create_issue':
+        return { ...base, title: args.title, body: args.body ?? '', labels: args.labels ?? [] };
+      case 'close_issue':
+        return { ...base, issue_number: Number(args.number), state: 'closed' };
+      case 'create_branch':
+        return { ...base, branch: args.branch, from_branch: args.fromRef ?? 'main' };
+      default:
+        return { ...base, ...args };
     }
-    return args;
   }
 
   async _remoteBranchDiff({ branch, base = 'main' }) {
@@ -108,10 +131,14 @@ export class GitHubMCP {
       owner: this.owner, repo: this.repo, base, head: branch,
     });
     const parsed = JSON.parse(findText(res) ?? '{}');
-    // normalize: the review stage only needs the unified diff text
+    // Every changed file produces a record — patchless (binary) entries get
+    // explicit metadata so an empty diff can only mean "no changes".
     return (parsed.files ?? [])
-      .map((f) => f.patch ? `diff --git a/${f.filename} b/${f.filename}\n${f.patch}` : '')
-      .filter(Boolean)
+      .map((f) =>
+        f.patch
+          ? `diff --git a/${f.filename} b/${f.filename}\n${f.patch}`
+          : `diff --git a/${f.filename} b/${f.filename}\nBinary or patchless change (${f.status ?? 'modified'}); ${f.additions ?? 0} additions, ${f.deletions ?? 0} deletions`,
+      )
       .join('\n');
   }
 
@@ -119,13 +146,18 @@ export class GitHubMCP {
     if (!this.owner || !this.repo) {
       throw new Error('FOREMAN_TARGET_GITHUB must be owner/repo for the remote MCP backend');
     }
-    for (const f of files) {
-      await this.remote.callTool('create_or_update_file', {
-        owner: this.owner, repo: this.repo, path: f.path, branch, message,
-        content: encodeBase64(f.content),
-      });
-    }
-    return { branch, committed: files.length };
+    // One atomic batch commit via push_files: a failure leaves the branch
+    // untouched instead of half-committed, and retries never re-apply
+    // already-successful per-file mutations.
+    const res = await this.remote.callTool('push_files', {
+      owner: this.owner,
+      repo: this.repo,
+      branch,
+      message,
+      files: files.map((f) => ({ path: f.path, content: f.content })),
+    });
+    const parsed = findText(res) ? JSON.parse(findText(res)) : null;
+    return { branch, committed: files.length, ...(parsed ?? {}) };
   }
 
   // ── typed helpers the harness actually uses ──────────────────────────────
@@ -139,15 +171,42 @@ export class GitHubMCP {
   getPRDiff(number) { return this.call('get_pull_request_diff', { number }, { tier: 'T0' }); }
   getBranchDiff(branch, base = 'main') { return this.call('get_branch_diff', { branch, base }, { tier: 'T0' }); }
   readFileAtRef(branch, filePath) { return this.call('read_file_at_ref', { branch, path: filePath }, { tier: 'T0' }); }
-  mergePR(number) { return this.call('merge_pull_request', { number }, { tier: 'T2' }); }
-  closeIssue(number) { return this.call('close_issue', { number }, { tier: 'T2' }); }
+
+  /**
+   * Merge is T2: irreversible and only ever executed on behalf of a satisfied
+   * approval. The gate's decision travels with the call — a facade caller
+   * that cannot show it never reaches the backend.
+   * @param {{ approvalId: string, decidedBy: string }} authorization from ApprovalGate.request()
+   */
+  async mergePR(number, authorization) {
+    if (!authorization?.approvalId || !authorization?.decidedBy) {
+      const err = new Error(
+        `merge PR #${number} requires a satisfied T2 approval: mergePR(number, { approvalId, decidedBy })`,
+      );
+      err.code = 'APPROVAL_REQUIRED';
+      throw err;
+    }
+    this.audit.record({
+      actor: authorization.decidedBy,
+      tier: 'T2',
+      action: 'merge_pull_request',
+      decision: `executing approval ${authorization.approvalId}`,
+      reason: `merge PR #${number}`,
+    });
+    return this.call('merge_pull_request', { number }, { tier: 'T2' });
+  }
+
+  closeIssue(number, authorization) {
+    if (!authorization?.approvalId || !authorization?.decidedBy) {
+      const err = new Error(`close issue #${number} requires a satisfied T2 approval`);
+      err.code = 'APPROVAL_REQUIRED';
+      return Promise.reject(err);
+    }
+    return this.call('close_issue', { number }, { tier: 'T2' });
+  }
 }
 
 function findText(res) {
   const part = (res?.content ?? []).find((c) => c.type === 'text');
   return part?.text ?? null;
-}
-
-function encodeBase64(s) {
-  return Buffer.from(s, 'utf8').toString('base64');
 }

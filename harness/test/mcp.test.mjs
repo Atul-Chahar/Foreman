@@ -116,6 +116,46 @@ test('local-git: branch diff and read-file-at-ref work without a PR', async () =
   assert.equal(missing, null);
 });
 
+test('local-git: agent-supplied paths cannot escape the repository', async () => {
+  const { dir, stateFile } = scratchRepo();
+  const mcp = new LocalGitMCP(dir, stateFile);
+  await mcp.callTool('create_branch', { branch: 'foreman/evil' });
+
+  for (const evil of ['../outside.mjs', '/etc/passwd', 'a/../../b.mjs']) {
+    await assert.rejects(
+      () =>
+        mcp.callTool('commit_files', {
+          branch: 'foreman/evil',
+          files: [{ path: evil, content: 'pwned\n' }],
+          message: 'escape attempt',
+        }),
+      /escapes repository|invalid repo path/,
+      `expected rejection for ${evil}`,
+    );
+  }
+  // symlink escape: a directory inside the repo pointing outside
+  fs.mkdirSync(path.join(dir, 'link'));
+  fs.writeFileSync(path.join(dir, 'secret.txt'), 'top secret\n');
+  fs.symlinkSync(path.join(path.dirname(dir), `${path.basename(dir)}-state.json`), path.join(dir, 'link', 'state'));
+  await assert.rejects(
+    () =>
+      mcp.callTool('commit_files', {
+        branch: 'foreman/evil',
+        files: [{ path: 'link/state', content: 'overwrite via symlink\n' }],
+        message: 'symlink escape attempt',
+      }),
+    /escapes repository/,
+  );
+});
+
+test('local-git: a broken diff fails closed instead of reading as "no changes"', async () => {
+  const { dir, stateFile } = scratchRepo();
+  const mcp = new LocalGitMCP(dir, stateFile);
+  await mcp.callTool('create_pull_request', { branch: 'no-such-branch', title: 'ghost PR' });
+  await assert.rejects(() => mcp.callTool('get_branch_diff', { branch: 'no-such-branch' }));
+  await assert.rejects(() => mcp.callTool('get_pull_request_diff', { number: 1 }));
+});
+
 test('rate limiter: bursts beyond capacity serialize instead of failing', async () => {
   const rl = new RateLimiter({ capacity: 3, refillPerSec: 1000, maxAttempts: 2 });
   let concurrent = 0;
@@ -150,4 +190,51 @@ test('github facade: local backend by default, remote when MCP command set', asy
   const gh = new GitHubMCP({ config, audit: auditStub });
   assert.equal(gh.backendKind, 'local');
   assert.ok(gh.local instanceof LocalGitMCP);
+});
+
+test('github facade: merge is refused without a satisfied T2 approval', async () => {
+  const config = loadConfig({ ...process.env });
+  config.dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'foreman-gh2-'));
+  config.targetLocal = config.dataDir;
+  const audited = [];
+  const gh = new GitHubMCP({ config, audit: { record: (e) => audited.push(e) } });
+
+  await assert.rejects(
+    () => gh.mergePR(1),
+    (e) => e.code === 'APPROVAL_REQUIRED',
+    'merge without authorization must be structurally impossible',
+  );
+  await assert.rejects(() => gh.closeIssue(1), (e) => e.code === 'APPROVAL_REQUIRED');
+  assert.equal(audited.length, 0, 'refused calls never reach the backend');
+
+  // with authorization the call goes through (local backend merges nothing
+  // here — use a nonexistent PR to prove the call REACHED the backend)
+  await assert.rejects(
+    () => gh.mergePR(999, { approvalId: 'appr-0001', decidedBy: 'human:alice' }),
+    /not found/,
+  );
+  assert.ok(audited.some((e) => e.action === 'merge_pull_request' && e.tier === 'T2'));
+});
+
+test('github facade: remote arg translation injects repo identity and maps field names', () => {
+  const config = loadConfig({
+    ...process.env,
+    FOREMAN_TARGET_GITHUB: 'acme/widgets',
+    FOREMAN_MCP_COMMAND: '/bin/true',
+    GITHUB_PERSONAL_ACCESS_TOKEN: 'stub',
+  });
+  config.dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'foreman-gh3-'));
+  const gh = new GitHubMCP({ config, audit: { record() {} } });
+  assert.equal(gh.backendKind, 'remote');
+
+  assert.deepEqual(gh._translateArgs('create_pull_request', { branch: 'foreman/t1', title: 'x' }), {
+    owner: 'acme', repo: 'widgets', head: 'foreman/t1', base: 'main', title: 'x', body: '',
+  });
+  assert.deepEqual(gh._translateArgs('get_pull_request', { number: '7' }), {
+    owner: 'acme', repo: 'widgets', pullNumber: 7,
+  });
+  assert.deepEqual(gh._translateArgs('close_issue', { number: 3 }), {
+    owner: 'acme', repo: 'widgets', issue_number: 3, state: 'closed',
+  });
+  return gh.close();
 });
