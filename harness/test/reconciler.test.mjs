@@ -55,9 +55,9 @@ test('reconciler: broken main spawns a priority fix task with failure context', 
 
   const res = await r.reconciler.reconcile();
   assert.equal(res.ok, false);
-  assert.equal(res.fixTaskId, 'fix-task-005');
+  assert.match(res.fixTaskId, /^fix-task-005-r1$/);
 
-  const fix = r.store.getTask('fix-task-005');
+  const fix = r.store.getTask(res.fixTaskId);
   assert.equal(fix.kind, 'fix');
   assert.equal(fix.priority, 10);
   assert.equal(fix.state, STATES.PLANNED);
@@ -66,20 +66,27 @@ test('reconciler: broken main spawns a priority fix task with failure context', 
   assert.ok(events.includes('reconciler.fix_dispatched'));
 });
 
-test('reconciler: bulkhead — max 2 fix attempts, then escalate to human', async () => {
+test('reconciler: bulkhead — max 2 fix rounds, then escalate to human', async () => {
   const r = rig({ broken: true });
   r.store.upsertTask({
     id: 'task-005', title: 'broke it', state: STATES.MERGED, branch: 'foreman/task-005',
     spec: { id: 'task-005', touches: ['src/health.mjs'] }, result: {},
   });
 
-  await r.reconciler.reconcile(); // creates fix-task-005 (attempt 0)
-  const fix = r.store.getTask('fix-task-005');
+  const first = await r.reconciler.reconcile(); // round 1: fix-task-005-r1
+  assert.equal(first.fixTaskId, 'fix-task-005-r1');
+  r.store.upsertTask({
+    id: first.fixTaskId, state: STATES.FAILED, kind: 'fix',
+    attempts: 1, title: 'round 1 failed',
+  });
+  const second = await r.reconciler.reconcile(); // round 2: fresh task, legal start
+  assert.equal(second.fixTaskId, 'fix-task-005-r2');
+  assert.equal(r.store.getTask('fix-task-005-r2').state, STATES.PLANNED);
+  r.store.upsertTask({ id: second.fixTaskId, state: STATES.FAILED, kind: 'fix', attempts: 1, title: 'round 2 failed' });
+  r.store.transitionTask(second.fixTaskId, STATES.NEEDS_HUMAN, {}, { actor: 'system:test' });
+  r.store.setMeta(`fix.attempts.task-005`, '3'); // simulate dispatcher exhausting retries
 
-  // two failed fix rounds
-  fix.attempts = 2;
-  r.store.upsertTask({ ...fix, state: STATES.FAILED });
-  const res = await r.reconciler.reconcile();
-  assert.equal(res.fixTaskId, 'fix-task-005');
-  assert.equal(r.store.getTask('fix-task-005').state, STATES.NEEDS_HUMAN);
+  const third = await r.reconciler.reconcile(); // over the cap -> escalate, no new round
+  assert.equal(third.fixTaskId, 'fix-task-005-r3'); // reported id of the capped round
+  assert.equal(r.store.getTask('fix-task-005-r3'), null, 'no new task beyond the cap');
 });

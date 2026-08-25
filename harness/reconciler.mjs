@@ -7,7 +7,7 @@
 // Self-healing does not mean self-approving: the fix PR goes through the
 // same T2 gate as everything else.
 
-import { STATES } from './core/state.mjs';
+import { STATES, canTransition } from './core/state.mjs';
 
 const RECONCILER_MAX_FIX_ATTEMPTS = 2;
 
@@ -62,27 +62,26 @@ export class Reconciler {
     return this.store.getMeta('main.test_command') || 'node --test test/*.test.mjs';
   }
 
-  /** Create or advance the fix task for the current breakage. Bulkheaded. */
+  /**
+   * Create the NEXT bounded fix round for the current breakage. Bulkheaded
+   * in two layers: the reconciler caps ROUNDS via meta, and each round is a
+   * fresh task so resetting never needs an illegal state transition.
+   */
   _dispatchFix(test) {
     const culprit = this._lastMergedTask();
-    const fixTaskId = `fix-${culprit?.id ?? 'unknown'}`;
+    const culpritId = culprit?.id ?? 'unknown';
+    const attemptsKey = `fix.attempts.${culpritId}`;
+    const attempts = Number(this.store.getMeta(attemptsKey) || '0');
 
-    const existing = this.store.getTask(fixTaskId);
-    if (existing) {
-      const attempts = existing.attempts;
-      if (attempts >= RECONCILER_MAX_FIX_ATTEMPTS) {
-        if (existing.state !== STATES.NEEDS_HUMAN) {
-          this.store.transitionTask(existing.id, STATES.NEEDS_HUMAN, {
-            result: { ...(existing.result ?? {}), escalated: 'reconciler bulkhead: max fix attempts reached' },
-          });
-          this.bus.emitEvent('reconciler.escalated', { fixTaskId, attempts }, (e) => this.store.persistEvent(e));
-        }
-        return fixTaskId;
-      }
-      // reset for another bounded attempt
-      this.store.transitionTask(existing.id, STATES.PLANNED);
-      return fixTaskId;
+    if (attempts >= RECONCILER_MAX_FIX_ATTEMPTS) {
+      this._escalate(culpritId, attempts);
+      return `fix-${culpritId}-r${attempts}`;
     }
+
+    // a fresh task per round: PLANNED start is always legal, and the old
+    // round's history stays intact for the audit trail
+    const fixTaskId = `fix-${culpritId}-r${attempts + 1}`;
+    this.store.setMeta(attemptsKey, String(attempts + 1));
 
     const spec = {
       id: fixTaskId,
@@ -117,9 +116,31 @@ export class Reconciler {
     return fixTaskId;
   }
 
+  /** Mark the latest round escalated — via a legal transition when one
+   *  exists, and always with a loud event + audit row regardless. */
+  _escalate(culpritId, attempts) {
+    const latest = this.store.getTask(`fix-${culpritId}-r${attempts}`);
+    if (latest && latest.state !== STATES.NEEDS_HUMAN && canTransition(latest.state, STATES.NEEDS_HUMAN)) {
+      this.store.transitionTask(latest.id, STATES.NEEDS_HUMAN, {
+        result: { ...(latest.result ?? {}), escalated: 'reconciler bulkhead: max fix rounds reached' },
+      }, { actor: 'system:reconciler', reason: 'max fix rounds' });
+    }
+    this.bus.emitEvent('reconciler.escalated', { culpritId, attempts }, (e) => this.store.persistEvent(e));
+    this.audit.record({
+      actor: 'system:reconciler', tier: null, action: 'reconciler_escalate',
+      decision: 'needs_human', reason: `${attempts} fix rounds exhausted for ${culpritId}`,
+    });
+  }
+
+  /**
+   * The culprit is the task merged MOST RECENTLY by merge sequence number —
+   * creation order says nothing about what landed on main last.
+   */
   _lastMergedTask() {
     const merged = this.store.listTasksInStates([STATES.MERGED]);
-    return merged.at(-1) ?? null;
+    return (
+      merged.sort((a, b) => (b.result?.merged?.seq ?? 0) - (a.result?.merged?.seq ?? 0))[0] ?? null
+    );
   }
 }
 

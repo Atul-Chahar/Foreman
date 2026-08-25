@@ -25,25 +25,33 @@ export class MergeQueue {
    * @param {import('./mcp_clients/github.mjs').GitHubMCP} deps.github
    * @param {import('./sandbox_runner.mjs').SandboxRunner} deps.sandbox
    * @param {import('./core/spend.mjs').SpendMeter} [deps.spend]
+   * @param {import('./reconciler.mjs').Reconciler} [deps.reconciler] health
+   *        check fired after every successful merge
    */
-  constructor({ store, bus, gate, github, sandbox, spend }) {
+  constructor({ store, bus, gate, github, sandbox, spend, reconciler }) {
     this.store = store;
     this.bus = bus;
     this.gate = gate;
     this.github = github;
     this.sandbox = sandbox;
     this.spend = spend;
-    this._busy = false;
+    this.reconciler = reconciler;
+    this._busy = false; // in-process re-entrancy guard only
+    this._lockOwner = `queue-${process.pid}-${Date.now().toString(36)}`;
   }
 
   /**
    * Process every task that has passed tests: open PRs, then drive each
-   * through the gate and the serialized merge. Sequential by design.
+   * through the gate and the serialized merge. Sequential by design. The
+   * critical section is guarded by a durable store lock so two queue
+   * processes sharing the database still merge one at a time.
    */
   async processAll() {
     if (this._busy) return;
+    if (!this.store.tryLock('merge', this._lockOwner)) return;
     this._busy = true;
     try {
+      await this._recoverStrandedMerges();
       // 1) open PRs for everything tests-passed (T1)
       for (const task of this.store.listTasksInStates([STATES.TESTS_PASSED])) {
         await this.openPR(task);
@@ -54,6 +62,33 @@ export class MergeQueue {
       }
     } finally {
       this._busy = false;
+      this.store.unlock('merge', this._lockOwner);
+    }
+  }
+
+  /**
+   * Crash recovery: if the process died between the irreversible merge and
+   * the state update, a task would be stranded in awaiting_approval forever.
+   * Ask the backend of record whether the PR actually merged, then repair.
+   */
+  async _recoverStrandedMerges() {
+    for (const task of this.store.listTasksInStates([STATES.AWAITING_APPROVAL])) {
+      if (this.store.getMeta(`merging.${task.id}`) !== '1') continue;
+      try {
+        const pr = await this.github.getPR(task.pr_number);
+        if (pr?.merged === true || pr?.state === 'merged') {
+          this.store.transitionTask(task.id, STATES.MERGED, {
+            result: { ...(task.result ?? {}), merged: { recovered: true } },
+          });
+          this.bus.emitEvent('merge.completed', {
+            taskId: task.id, pr: task.pr_number, recovered: true,
+          }, (e) => this.store.persistEvent(e));
+        }
+      } catch {
+        /* backend unreachable — leave it; retried on the next pass */
+      } finally {
+        this.store.setMeta(`merging.${task.id}`, '');
+      }
     }
   }
 
@@ -105,6 +140,7 @@ export class MergeQueue {
           diff: await this.safeDiff(task),
           tests: task.result?.test ?? {},
           files: task.result?.files ?? [],
+          pr_number: task.pr_number, // binds this gate round to THIS PR
         },
       });
       this.store.transitionTask(task.id, STATES.AWAITING_APPROVAL);
@@ -133,8 +169,9 @@ export class MergeQueue {
 
   /**
    * The T2 authorization that travels with the merge call: the approval id
-   * and the human who made the decision. The merge facade refuses to execute
-   * without it — the gate's yes is what unlocks the irreversible action.
+   * and the human who made the decision. Recovery only accepts approvals
+   * recorded for THIS PR's gate round (detail.pr_number) — a stale approved
+   * row from an earlier round can never unlock a later merge.
    */
   _authorizationFor(task, verdict = null) {
     let a = null;
@@ -143,14 +180,20 @@ export class MergeQueue {
       if (row?.status === 'approved') a = row;
     }
     if (!a) {
-      [a] = this.store
+      const candidates = this.store
         .listApprovals('approved')
-        .filter((x) => x.task_id === task.id && x.action === 'merge_to_main');
+        .filter((x) => x.task_id === task.id && x.action === 'merge_to_main')
+        .filter((x) => !x.detail?.pr_number || x.detail.pr_number === task.pr_number)
+        .sort((x, y) => (y.decided_at ?? '').localeCompare(x.decided_at ?? ''));
+      [a] = candidates;
     }
     return a ? { approvalId: a.id, decidedBy: a.decided_by ?? 'human:unknown' } : null;
   }
 
-  /** The serialized, verified merge. One at a time, rebase-test first. */
+  /** The serialized, verified merge. One at a time, rebase-test first.
+   *  Crash safety: `merging.<task>` is set before the irreversible call and
+   *  cleared after the state update — a crash in between is repaired by
+   *  _recoverStrandedMerges on the next pass instead of stranding the task. */
   async executeMerge(task, authorization) {
     this.bus.emitEvent('merge.started', { taskId: task.id, pr: task.pr_number }, (e) => this.store.persistEvent(e));
     try {
@@ -166,11 +209,27 @@ export class MergeQueue {
         return; // queue keeps moving; one conflict never stalls it
       }
 
-      const merged = await this.github.mergePR(task.pr_number, authorization);
-      this.store.transitionTask(task.id, STATES.MERGED, { result: { ...(task.result ?? {}), merged: merged } });
+      // what we verified is the REBASED branch — push that head so the merge
+      // executes exactly what was tested, not a stale remote head
+      await this.github.pushBranch?.(task.branch);
+
+      const seq = Number(this.store.getMeta('merge.seq') || '0') + 1;
+      this.store.setMeta(`merging.${task.id}`, '1');
+      let merged;
+      try {
+        merged = await this.github.mergePR(task.pr_number, authorization);
+      } finally {
+        this.store.setMeta(`merging.${task.id}`, '');
+      }
+      this.store.setMeta('merge.seq', String(seq));
+      merged = { ...merged, seq };
+      this.store.transitionTask(task.id, STATES.MERGED, { result: { ...(task.result ?? {}), merged } });
       this.bus.emitEvent('merge.completed', {
-        taskId: task.id, pr: task.pr_number, head: merged.head,
+        taskId: task.id, pr: task.pr_number, head: merged.head, seq,
       }, (e) => this.store.persistEvent(e));
+
+      // main just moved — check its health now, not on someone else's cron
+      if (this.reconciler) await this.reconciler.reconcile({ trigger: `post-merge:${task.id}` });
     } catch (err) {
       if (err.code === 'MERGE_CONFLICT' || /conflict/i.test(err.message ?? '')) {
         this.store.transitionTask(task.id, STATES.NEEDS_HUMAN, {

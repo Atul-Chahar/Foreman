@@ -223,6 +223,40 @@ export class Store {
     }
   }
 
+  /**
+   * Durable TTL lock keyed in meta — serializes critical sections across
+   * independent processes sharing the database, unlike any in-memory flag.
+   * @returns {boolean} true when the lock was acquired
+   */
+  tryLock(key, owner, ttlMs = 120_000) {
+    return this._tx(() => {
+      const raw = this.getMeta(`lock.${key}`);
+      if (raw) {
+        try {
+          const held = JSON.parse(raw);
+          if (held.o !== owner && Date.now() < held.exp) return false;
+        } catch {
+          /* corrupt lock row — treat as stale and take it over */
+        }
+      }
+      this.setMeta(`lock.${key}`, JSON.stringify({ o: owner, exp: Date.now() + ttlMs }));
+      return true;
+    });
+  }
+
+  /** Release a lock. Only the owner (or a stale-expired holder) can. */
+  unlock(key, owner) {
+    this._tx(() => {
+      const raw = this.getMeta(`lock.${key}`);
+      if (!raw) return;
+      try {
+        const held = JSON.parse(raw);
+        if (held.o !== owner) return;
+      } catch { /* fall through: ours to clean */ }
+      this.setMeta(`lock.${key}`, '');
+    });
+  }
+
   _taskFromRow(row) {
     return {
       ...row,

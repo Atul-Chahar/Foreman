@@ -172,6 +172,11 @@ export class GitHubMCP {
   getBranchDiff(branch, base = 'main') { return this.call('get_branch_diff', { branch, base }, { tier: 'T0' }); }
   readFileAtRef(branch, filePath) { return this.call('read_file_at_ref', { branch, path: filePath }, { tier: 'T0' }); }
 
+  /** Push a branch head so the merge executes exactly what was rebase-tested
+   *  locally, not a stale remote head. Local backend pushes to its origin
+   *  (a no-op for throwaway demo repos); remote backends must support it. */
+  pushBranch(branch) { return this.call('push', { branch }, { tier: 'T1' }); }
+
   /**
    * Merge is T2: irreversible and only ever executed on behalf of a satisfied
    * approval. The gate's decision travels with the call — a facade caller
