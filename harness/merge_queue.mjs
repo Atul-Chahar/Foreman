@@ -27,8 +27,10 @@ export class MergeQueue {
    * @param {import('./core/spend.mjs').SpendMeter} [deps.spend]
    * @param {import('./reconciler.mjs').Reconciler} [deps.reconciler] health
    *        check fired after every successful merge
+   * @param {import('./reviewer.mjs').ReviewStage} [deps.reviewer] heuristic
+   *        review gating swarm PRs before they open
    */
-  constructor({ store, bus, gate, github, sandbox, spend, reconciler }) {
+  constructor({ store, bus, gate, github, sandbox, spend, reconciler, reviewer }) {
     this.store = store;
     this.bus = bus;
     this.gate = gate;
@@ -36,6 +38,7 @@ export class MergeQueue {
     this.sandbox = sandbox;
     this.spend = spend;
     this.reconciler = reconciler;
+    this.reviewer = reviewer ?? null;
     this._busy = false; // in-process re-entrancy guard only
     this._lockOwner = `queue-${process.pid}-${Date.now().toString(36)}`;
   }
@@ -95,12 +98,39 @@ export class MergeQueue {
   async openPR(task) {
     const branch = task.branch;
     const result = task.result ?? {};
+
+    // review BEFORE any PR: blocking findings stop the task, no PR opens.
+    // (the reviewer emits review.passed/blocked itself — the queue only
+    // persists the decision, it does not duplicate the event)
+    if (this.reviewer && result.review === undefined) {
+      const review = await this.reviewer.run({ task });
+      if (!review.ok) {
+        this.store.transitionTask(task.id, STATES.NEEDS_HUMAN, {
+          result: { ...result, review },
+        });
+        return; // queue keeps moving; one blocked task never stalls it
+      }
+      result.review = review;
+      this.store.upsertTask({ ...task, result });
+    }
+
+    const reviewSection = result.review
+      ? [
+          '## Review',
+          ...(result.review.findings.length === 0
+            ? ['- clean: no findings']
+            : result.review.findings.map((f) => `- **${f.severity}** ${f.rule}${f.file ? ` (${f.file})` : ''}: ${f.message}`)),
+          '',
+        ]
+      : [];
+
     const body = [
       `Closes #${task.spec?.issue_number ?? '?'}`,
       '',
       '## Acceptance criteria',
       ...(task.spec?.acceptance_criteria ?? []).map((c) => `- [x] ${c}`),
       '',
+      ...reviewSection,
       '## Sandbox test run',
       '```',
       `exit=${result.test?.exitCode} timedOut=${result.test?.timedOut ?? false} durationMs=${result.test?.durationMs ?? 0}`,
@@ -139,6 +169,7 @@ export class MergeQueue {
         detail: {
           diff: await this.safeDiff(task),
           tests: task.result?.test ?? {},
+          review: task.result?.review ?? null,
           files: task.result?.files ?? [],
           pr_number: task.pr_number, // binds this gate round to THIS PR
         },
