@@ -15,6 +15,7 @@ import { slug } from '../core/ids.mjs';
 const FILE_RE = /\b((?:src|lib|test|tests|app|harness|scripts)\/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+)/g;
 const CMD_RE = /^\s*(?:test|run tests|command)\s*:\s*`?([^`\n]+)`?/im;
 const CRITERIA_RE = /^\s*(?:acceptance|criteria|done when)\s*:\s*$/im;
+const IMPL_RE = /```impl\s*\n([\s\S]*?)```/;
 
 /** Extract a structured spec from a raw issue. Pure; safe to re-run. */
 export function enhanceSpec(issue, { taskId }) {
@@ -54,6 +55,16 @@ export function enhanceSpec(issue, { taskId }) {
   // files this task is expected to modify = context files under src/ or lib/
   const touches = contextFiles.filter((f) => /^(src|lib)\//.test(f));
 
+  // structured impl block: executed verbatim by the local backend
+  let impl = null;
+  const implMatch = IMPL_RE.exec(body);
+  if (implMatch) {
+    try {
+      const parsed = JSON.parse(implMatch[1]);
+      if (Array.isArray(parsed) && parsed.every((f) => f?.path && f?.content !== undefined)) impl = parsed;
+    } catch { /* malformed impl blocks are ignored, not fatal */ }
+  }
+
   return {
     id: taskId,
     title: issue.title,
@@ -65,6 +76,7 @@ export function enhanceSpec(issue, { taskId }) {
     touches,
     risk_tier: riskTier,
     conflicts_with: [],
+    impl,
     body_excerpt: body.slice(0, 600),
   };
 }

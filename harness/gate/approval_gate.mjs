@@ -177,7 +177,7 @@ export class ApprovalGate {
     const activeStates = new Set(['awaiting_approval', 'pr_open']);
     for (const a of this.pending()) {
       const task = this.store.getTask(a.task_id);
-      if (!task || !activeStates.includes(task.state)) this.cancel(a.id, 'task no longer awaiting approval');
+      if (!task || !activeStates.has(task.state)) this.cancel(a.id, 'task no longer awaiting approval');
     }
   }
 }
