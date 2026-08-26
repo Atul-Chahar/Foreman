@@ -88,6 +88,7 @@ export class Reconciler {
       title: `Fix broken main after ${culprit ? `"${culprit.title}"` : 'unknown merge'}`,
       issue_number: culprit?.spec?.issue_number ?? null,
       source: 'reconciler',
+      skills: ['build-fix'], // the fix agent's competency loadout
       context_files: culprit?.spec?.touches ?? [],
       acceptance_criteria: ['test suite on main passes again'],
       test_command: this._mainTestCommand(),

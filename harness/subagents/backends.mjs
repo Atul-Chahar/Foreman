@@ -14,18 +14,25 @@
 //     CI, and the seeded demo. Same lifecycle, same gates, same events —
 //     only the "brain" differs.
 
+import path from 'node:path';
+import { composePrompt } from '../skills/loader.mjs';
+
 export class TrueForgeBackend {
   /**
    * @param {object} deps
    * @param {import('../config.mjs').Config} deps.config
    * @param {Function} [deps.fetchImpl] injectable fetch (tests)
+   * @param {import('../skills/loader.mjs').SkillRegistry} [deps.registry]
+   *        when set, prompts are composed from skills (role + competencies);
+   *        otherwise a plain structured spec prompt is used
    */
-  constructor({ config, fetchImpl = globalThis.fetch }) {
+  constructor({ config, fetchImpl = globalThis.fetch, registry = null }) {
     if (!config.trueforgeUrl) throw new Error('TrueForgeBackend requires FOREMAN_TRUEFORGE_URL');
     this.url = config.trueforgeUrl.replace(/\/+$/, '');
     this.token = config.trueforgeToken;
     this.model = config.trueforgeModel || null; // server default when unset
     this.fetch = fetchImpl;
+    this.registry = registry;
   }
 
   get name() { return 'trueforge'; }
@@ -80,13 +87,44 @@ export class TrueForgeBackend {
     // 2. start the turn that carries the actual task
     const turn = await this._json(`/api/v1/sessions/${sessionId}/turns`, {
       method: 'POST',
-      body: { input: [{ type: 'user.message', content: buildPrompt({ ...spec, branch }) }] },
+      body: { input: [{ type: 'user.message', content: this.buildPrompt({ ...spec, branch }) }] },
       signal,
     });
     const turnId = turn.id ?? turn.turnId ?? turn.turn_id;
 
     // 3. poll the turn to a terminal state
     return this.awaitTurn(sessionId, turnId, { signal });
+  }
+
+  /**
+   * Skill-driven prompt: role + competencies + structured spec block.
+   * Falls back to a plain spec prompt when no registry is available.
+   */
+  buildPrompt(spec) {
+    if (this.registry) {
+      return composePrompt({
+        role: 'implementer',
+        registry: this.registry,
+        // fix agents get build-fix; plain implementers get tdd + search
+        extraSkills: spec.source === 'reconciler'
+          ? ['build-fix', 'search-first']
+          : ['tdd-workflow', 'search-first'],
+        spec,
+      });
+    }
+    return [
+      `# Task ${spec.id}: ${spec.title}`,
+      spec.body_excerpt,
+      '',
+      '## Acceptance criteria',
+      ...(spec.acceptance_criteria ?? []).map((c) => `- ${c}`),
+      '',
+      '## Scope',
+      `Work on branch: ${spec.branch ?? '(assigned by dispatcher)'}`,
+      `Only modify: ${(spec.touches ?? []).join(', ') || '(from context files)'}`,
+      `Context files: ${(spec.context_files ?? []).join(', ') || '(none listed)'}`,
+      `Verify with: ${spec.test_command ?? 'the repo test suite'}`,
+    ].join('\n');
   }
 
   async awaitTurn(sessionId, turnId, { pollMs = 2000, maxMs = 600_000, signal } = {}) {
@@ -112,22 +150,6 @@ export class TrueForgeBackend {
       await new Promise((r) => setTimeout(r, pollMs));
     }
   }
-}
-
-function buildPrompt(spec) {
-  return [
-    `# Task ${spec.id}: ${spec.title}`,
-    spec.body_excerpt,
-    '',
-    '## Acceptance criteria',
-    ...spec.acceptance_criteria.map((c) => `- ${c}`),
-    '',
-    '## Scope',
-    `Work on branch: ${spec.branch ?? '(assigned by dispatcher)'}`,
-    `Only modify: ${spec.touches.join(', ') || '(from context files)'}`,
-    `Context files: ${spec.context_files.join(', ') || '(none listed)'}`,
-    `Verify with: ${spec.test_command ?? 'the repo test suite'}`,
-  ].join('\n');
 }
 
 export class LocalBackend {

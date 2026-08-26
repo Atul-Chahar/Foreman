@@ -65,8 +65,20 @@ export class MergeQueue {
       }
     } finally {
       this._busy = false;
-      this.store.unlock('merge', this._lockOwner);
+      try {
+        this.store.unlock('merge', this._lockOwner);
+      } catch {
+        // store already closed (process stopped while parked at the gate) —
+        // releaseLock() ran during stop(); nothing to do here
+      }
     }
+  }
+
+  /** Release the durable merge lock if we hold it. Called on graceful
+   *  shutdown — a stopped harness must not leave the next process waiting
+   *  out our lock TTL. */
+  releaseLock() {
+    this.store.unlock('merge', this._lockOwner);
   }
 
   /**
