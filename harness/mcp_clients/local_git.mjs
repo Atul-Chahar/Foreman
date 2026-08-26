@@ -218,7 +218,16 @@ export class LocalGitMCP {
     return { number: pr.number, merged: true, head: this._git(['rev-parse', 'HEAD']).stdout.trim() };
   }
 
-  async push() { return { ok: true, note: 'local adapter: push is a no-op' }; }
+  async push({ branch }) {
+    if (branch) {
+      // best effort: demo repos often have no configured origin — the local
+      // backend's merge reads the LOCAL branch head either way
+      const r = this._git(['push', 'origin', branch], { allowFail: true });
+      if (r.status === 0) return { ok: true, pushed: branch };
+      return { ok: true, note: `no remote configured; kept local head for ${branch}` };
+    }
+    return { ok: true, note: 'local adapter: bare push is a no-op' };
+  }
 
   // ── git plumbing ──────────────────────────────────────────────────────────
 

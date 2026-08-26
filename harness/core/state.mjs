@@ -19,17 +19,17 @@ const T = STATES;
 
 /** Allowed transitions. Anything not listed is a bug, not a shortcut. */
 export const TRANSITIONS = Object.freeze({
-  [T.PLANNED]: [T.DISPATCHED, T.NEEDS_HUMAN, T.FAILED],
+  [T.PLANNED]: [T.DISPATCHED, T.NEEDS_HUMAN, T.FAILED, T.REJECTED],
   [T.DISPATCHED]: [T.RUNNING, T.FAILED, T.NEEDS_HUMAN],
   [T.RUNNING]: [T.TESTS_PASSED, T.TESTS_FAILED, T.FAILED, T.NEEDS_HUMAN],
-  [T.TESTS_PASSED]: [T.PR_OPEN, T.FAILED, T.NEEDS_HUMAN],
-  [T.TESTS_FAILED]: [T.DISPATCHED, T.FAILED, T.NEEDS_HUMAN], // retry loop
+  [T.TESTS_PASSED]: [T.PR_OPEN, T.FAILED, T.NEEDS_HUMAN, T.REJECTED],
+  [T.TESTS_FAILED]: [T.DISPATCHED, T.FAILED, T.NEEDS_HUMAN, T.REJECTED], // retry loop, or human drops it
   [T.PR_OPEN]: [T.AWAITING_APPROVAL, T.NEEDS_HUMAN, T.REJECTED],
   [T.AWAITING_APPROVAL]: [T.MERGED, T.REJECTED, T.NEEDS_HUMAN],
   [T.NEEDS_HUMAN]: [T.PLANNED, T.DISPATCHED, T.REJECTED], // human resolves
   [T.MERGED]: [],
   [T.REJECTED]: [],
-  [T.FAILED]: [T.DISPATCHED, T.PLANNED], // bounded retry from the scheduler
+  [T.FAILED]: [T.DISPATCHED, T.PLANNED, T.REJECTED, T.NEEDS_HUMAN], // bounded retry, escalation, or human drops it
 });
 
 export const TERMINAL_STATES = Object.freeze(
