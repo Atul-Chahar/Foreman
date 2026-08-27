@@ -35,6 +35,18 @@ node harness/cli.mjs approve appr-0001 --reason "tests pass"
 node harness/cli.mjs killswitch engage   # freeze everything, instantly
 ```
 
+For the real TrueForge demo, start the local TrueForge server first and set
+the three `FOREMAN_TRUEFORGE_*` values in `.env`. Then use two terminals:
+
+```bash
+# terminal 1 — stays alive at each durable gate
+node harness/cli.mjs demo
+
+# terminal 2 — inspect and decide; each decision re-drives the pipeline
+node harness/cli.mjs approvals
+node harness/cli.mjs approve appr-0001 --reason "reviewed generated files"
+```
+
 Run against your own GitHub repo:
 
 ```bash
@@ -95,6 +107,22 @@ Foreman's implementer agents are **TrueForge sessions**, not homegrown loops:
 Configure with `FOREMAN_TRUEFORGE_URL` / `FOREMAN_TRUEFORGE_TOKEN` /
 `FOREMAN_TRUEFORGE_MODEL`.
 
+```bash
+# Validate the configured local TrueForge server without touching a repo
+npm run trueforge:smoke
+
+# Opt-in live integration test (creates one session and one turn)
+npm run test:trueforge
+```
+
+Completed turns must return a strict
+`{"files":[{"path":"src/x.mjs","content":"complete contents"}]}` envelope.
+Foreman sanitizes every relative path, routes branch and commit operations
+through the same T1 approval bridge as the local backend, commits through its
+GitHub/local-git facade, and only reports success after the target repository's
+sandboxed test command passes. Model output therefore cannot bypass policy or
+write directly to the host checkout.
+
 ## Qodo Code Review Evidence
 
 Per hackathon rules, **every** substantive change landed through a PR reviewed
@@ -125,12 +153,14 @@ Sample inline review threads:
 npm test    # node:test, zero dependencies
 ```
 
-111 tests across unit and integration levels, including:
+118 tests across unit and integration levels (116 default-pass + 2 opt-in
+TrueForge live tests), including:
 
 - full pipeline on a real scratch git repo (issue → swarm → review → gate → merge),
 - restart durability (approvals, locks, stranded-merge recovery),
 - security regression tests (path traversal incl. dangling symlinks, secret scanning,
   injection heuristics, spend-cap edges, kill-switch semantics).
+- TrueForge protocol, output-envelope, gated materialization, and opt-in live coverage.
 
 ## Repository layout
 

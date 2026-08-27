@@ -32,5 +32,6 @@ data/
 demo-target/
 *.log
 session-*.md
+HANDOFF.md
 dbg-*.mjs
 .claude/

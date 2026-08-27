@@ -230,6 +230,44 @@ test('validTitle rejects junk', () => {
         '- no limit returns everything (existing behavior preserved)',
         '',
         `test: \`${TEST_CMD}\``,
+        '',
+        '```impl',
+        JSON.stringify([
+          {
+            path: 'src/routes/todos.mjs',
+            content: `import { listTodos, addTodo } from '../db.mjs';
+
+export function handle(method, url, body) {
+  const [path, query] = url.split('?');
+  if (method === 'GET' && path === '/todos') {
+    const params = new URLSearchParams(query ?? '');
+    const limit = Number(params.get('limit') ?? Infinity);
+    return { status: 200, body: listTodos().slice(0, limit) };
+  }
+  if (method === 'POST' && path === '/todos') {
+    return { status: 201, body: { error: 'not implemented here — see POST task' } };
+  }
+  return { status: 404, body: { error: 'not found' } };
+}
+`,
+          },
+          {
+            path: 'test/pagination.test.mjs',
+            content: `import test from 'node:test';
+import assert from 'node:assert/strict';
+import { handle } from '../src/routes/todos.mjs';
+
+test('GET /todos?limit=1 pages', () => {
+  handle('POST', '/todos', { title: 'a' });
+  handle('POST', '/todos', { title: 'b' });
+  const res = handle('GET', '/todos?limit=1');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.length, 1);
+});
+`,
+          },
+        ]),
+        '```',
       ].join('\n'),
     },
     {
@@ -242,6 +280,45 @@ test('validTitle rejects junk', () => {
         '- DELETE /todos returns 405 with an Allow header hint in the body',
         '',
         `test: \`${TEST_CMD}\``,
+        '',
+        '```impl',
+        JSON.stringify([
+          {
+            path: 'src/routes/todos.mjs',
+            content: `import { listTodos, addTodo } from '../db.mjs';
+
+export function handle(method, url, body) {
+  if (method === 'GET' && url === '/todos') return { status: 200, body: listTodos() };
+  if (method === 'POST' && url === '/todos') {
+    return { status: 201, body: { error: 'not implemented here — see POST task' } };
+  }
+  if (url === '/todos') {
+    // known resource, unsupported method: 405 per RFC 9110
+    return { status: 405, body: { error: 'method not allowed', allow: 'GET, POST' } };
+  }
+  return { status: 404, body: { error: 'not found' } };
+}
+`,
+          },
+          {
+            path: 'test/method405.test.mjs',
+            content: `import test from 'node:test';
+import assert from 'node:assert/strict';
+import { handle } from '../src/routes/todos.mjs';
+
+test('DELETE /todos is a 405, not a 404', () => {
+  const res = handle('DELETE', '/todos');
+  assert.equal(res.status, 405);
+  assert.ok(res.body.allow.includes('GET'));
+});
+
+test('unknown paths still 404', () => {
+  assert.equal(handle('DELETE', '/nope').status, 404);
+});
+`,
+          },
+        ]),
+        '```',
       ].join('\n'),
     },
     {
@@ -254,6 +331,73 @@ test('validTitle rejects junk', () => {
         '- POST /todos/3/done marks todo 3 done and returns it',
         '',
         `test: \`${TEST_CMD}\``,
+        '',
+        '```impl',
+        JSON.stringify([
+          {
+            path: 'src/routes/todos.mjs',
+            content: `import { listTodos, addTodo, toggleDone } from '../db.mjs';
+
+export function handle(method, url, body) {
+  const done = /^\\/todos\\/(\\d+)\\/done$/.exec(url);
+  if (method === 'POST' && done) {
+    const updated = toggleDone(Number(done[1]));
+    return updated ? { status: 200, body: updated } : { status: 404, body: { error: 'not found' } };
+  }
+  if (method === 'GET' && url === '/todos') return { status: 200, body: listTodos() };
+  if (method === 'POST' && url === '/todos') {
+    return { status: 201, body: { error: 'not implemented here — see POST task' } };
+  }
+  return { status: 404, body: { error: 'not found' } };
+}
+`,
+          },
+          {
+            path: 'src/db.mjs',
+            content: `// in-memory store (the legacy table the reconciler demo later drops)
+let todos = [
+  { id: 1, title: 'write the README', done: true },
+  { id: 2, title: 'seed the backlog', done: true },
+  { id: 3, title: 'supervise the swarm', done: false },
+];
+
+export function addTodo(title) {
+  const todo = { id: todos.length + 1, title, done: false };
+  todos.push(todo);
+  return todo;
+}
+
+export function listTodos() {
+  return todos;
+}
+
+export function toggleDone(id) {
+  const todo = todos.find((t) => t.id === id);
+  if (!todo) return null;
+  todo.done = !todo.done;
+  return todo;
+}
+`,
+          },
+          {
+            path: 'test/done.test.mjs',
+            content: `import test from 'node:test';
+import assert from 'node:assert/strict';
+import { handle } from '../src/routes/todos.mjs';
+
+test('POST /todos/3/done toggles todo 3', () => {
+  const res = handle('POST', '/todos/3/done');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.done, true);
+});
+
+test('unknown id is a 404', () => {
+  assert.equal(handle('POST', '/todos/999/done').status, 404);
+});
+`,
+          },
+        ]),
+        '```',
       ].join('\n'),
     },
     {
@@ -267,6 +411,49 @@ test('validTitle rejects junk', () => {
         '- empty q returns all',
         '',
         `test: \`${TEST_CMD}\``,
+        '',
+        '```impl',
+        JSON.stringify([
+          {
+            path: 'src/routes/todos.mjs',
+            content: `import { listTodos, addTodo } from '../db.mjs';
+
+export function handle(method, url, body) {
+  const [path, query] = url.split('?');
+  if (method === 'GET' && path === '/todos') {
+    const params = new URLSearchParams(query ?? '');
+    const q = (params.get('q') ?? '').toLowerCase();
+    const all = listTodos();
+    return { status: 200, body: q ? all.filter((t) => t.title.toLowerCase().includes(q)) : all };
+  }
+  if (method === 'POST' && path === '/todos') {
+    return { status: 201, body: { error: 'not implemented here — see POST task' } };
+  }
+  return { status: 404, body: { error: 'not found' } };
+}
+`,
+          },
+          {
+            path: 'test/search.test.mjs',
+            content: `import test from 'node:test';
+import assert from 'node:assert/strict';
+import { handle } from '../src/routes/todos.mjs';
+
+test('q filters by substring', () => {
+  handle('POST', '/todos', { title: 'swarm supervisor' });
+  handle('POST', '/todos', { title: 'unrelated' });
+  const res = handle('GET', '/todos?q=swarm');
+  assert.equal(res.body.length, 1);
+  assert.equal(res.body[0].title, 'swarm supervisor');
+});
+
+test('empty q returns everything', () => {
+  assert.ok(handle('GET', '/todos').body.length >= 2);
+});
+`,
+          },
+        ]),
+        '```',
       ].join('\n'),
     },
     {

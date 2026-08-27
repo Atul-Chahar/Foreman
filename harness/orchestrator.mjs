@@ -40,19 +40,41 @@ export class Orchestrator {
     // skills registry: startup fails loud on any malformed skill
     this.skills = loadSkills(path.join(config.root, 'skills'));
 
+    const authorizeWrite = async (action, ctx) => {
+      const verdict = this.policy.decide(action, ctx);
+      if (verdict.decision === 'auto') return { allowed: true };
+      if (verdict.decision === 'block') return { allowed: false, reason: verdict.reason };
+      const cacheKey = ctx.taskId ?? 'adhoc';
+      this._taskWriteVerdicts ??= new Map();
+      if (!this._taskWriteVerdicts.has(cacheKey)) {
+        const outcome = await this.gate.request({
+          taskId: ctx.taskId,
+          action,
+          summary: `Allow agent writes for ${cacheKey} (branch + commit on its own branch)`,
+          detail: { files: ctx.files ?? [], tier: verdict.tier },
+        });
+        this._taskWriteVerdicts.set(cacheKey, outcome.outcome === 'approved');
+      }
+      return this._taskWriteVerdicts.get(cacheKey)
+        ? { allowed: true }
+        : { allowed: false, reason: 'human declined agent writes for this task' };
+    };
+
     this.backend = config.trueforgeUrl
-      ? new TrueForgeBackend({ config, registry: this.skills })
+      ? new TrueForgeBackend({
+          config,
+          registry: this.skills,
+          github: this.github,
+          sandbox: this.sandbox,
+          authorize: authorizeWrite,
+        })
       : new LocalBackend({
           github: this.github,
           sandbox: this.sandbox,
-          // the policy bridge the local backend requires: every write is a
-          // registry action routed through the engine — fail closed
-          authorize: (action, ctx) => {
-            const verdict = this.policy.decide(action, ctx);
-            return verdict.decision === 'auto'
-              ? { allowed: true }
-              : { allowed: false, reason: verdict.reason };
-          },
+          // The policy bridge the local backend requires. Gated actions are
+          // NOT refusals — they become real pending approvals on the console;
+          // one yes per task covers its write set.
+          authorize: authorizeWrite,
         });
 
     this.spend = new SpendMeter({

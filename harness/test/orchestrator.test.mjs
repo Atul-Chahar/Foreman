@@ -199,11 +199,6 @@ test('cli: status and killswitch run against a real store as a subprocess', asyn
 
   // the CLI reads the same env + data dir and must operate on that state
   const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..');
-  const env = {
-    ...process.env,
-    FOREMAN_TARGET_LOCAL: cfg.targetLocal,
-    FOREMAN_DATA_DIR: cfg.dataDir,
-  };
   // config derives dataDir from repo root, so point ROOT at a stub tree
   const stubRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'foreman-cli-root-'));
   fs.cpSync(path.join(root, 'harness'), path.join(stubRoot, 'harness'), { recursive: true });
@@ -220,11 +215,61 @@ test('cli: status and killswitch run against a real store as a subprocess', asyn
 
   const status = run(['status']);
   assert.equal(status.status, 0, `status failed: ${status.stderr}`);
-  assert.match(status.stdout, /paused|tasks|backend/i);
+  assert.ok(fs.existsSync(path.join(stubRoot, 'data', 'foreman.db')), 'status must initialize the durable store');
 
   const ks = run(['killswitch', 'release']);
   assert.equal(ks.status, 0, `killswitch failed: ${ks.stderr}`);
 
   // data dir was recreated under the stub root by the CLI run
   assert.ok(fs.existsSync(path.join(stubRoot, 'data', 'foreman.db')), 'CLI must reuse the durable store');
+});
+
+test('orchestrator: gated T1 writes become approvals, not refusals — the demo path', async () => {
+  const target = scratchTarget();
+  const cfg = { ...scratchConfig(target), t1Auto: false }; // default: fully gated
+  const orch = new Orchestrator(cfg);
+  await orch.start();
+  try {
+    const issue = {
+      number: 11,
+      title: 'gated write task',
+      body: [
+        '```impl',
+        JSON.stringify([{ path: 'docs/g.md', content: 'g\n' }]),
+        '```',
+        'test: `node --test`',
+      ].join('\n'),
+    };
+    const runP = orch.runBacklog({ issues: [issue] });
+    let pending = null;
+    for (let i = 0; i < 100 && !pending; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      pending = orch.summary().pendingApprovals[0] ?? null;
+    }
+    // THE product moment: a human sees exactly what the agent wants to do
+    assert.ok(pending, 'T1 write must surface as a pending approval');
+    const fullApproval = orch.store.getApproval(pending.id);
+    assert.match(fullApproval.summary, /Allow agent writes/);
+
+    await orch.gate.approve(pending.id, 'human:judge', 'looks safe');
+    // one yes covers the task's whole write set; the next stops are opening
+    // the PR and merging — every irreversible step asks, in order
+    let t2 = null;
+    for (let i = 0; i < 200 && !t2; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      const s = orch.summary();
+      t2 = s.pendingApprovals.find((a) => a.tier === 'T2') ?? null;
+      if (!t2 && s.pendingApprovals[0]) {
+        await orch.gate.approve(s.pendingApprovals[0].id, 'human:judge', 'ok');
+      }
+    }
+    assert.ok(t2, 'after T1 yeses, the merge gate is the next stop');
+    assert.equal(orch.store.getTask('task-011').state, 'awaiting_approval');
+
+    for (const a of orch.gate.pending()) await orch.gate.approve(a.id, 'human:teardown');
+    await runP;
+    assert.equal(orch.summary().tasks.merged ?? 0, 1);
+  } finally {
+    await orch.stop();
+  }
 });

@@ -38,6 +38,7 @@ async function withOrchestrator(fn) {
   const orch = new Orchestrator(loadConfig());
   try {
     await orch.start();
+    console.log(`foreman: backend=${orch.backend.name} target=${orch.config.targetLocal}`);
     return await fn(orch);
   } finally {
     await orch.stop();
@@ -280,4 +281,10 @@ async function main() {
   }
 }
 
-main().catch((err) => fail(err.message));
+try {
+  // Top-level await makes the CLI lifecycle explicit: Node must not finish
+  // while an async command (including a durable approval wait) is unsettled.
+  await main();
+} catch (err) {
+  fail(err.message);
+}

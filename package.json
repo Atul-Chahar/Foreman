@@ -14,8 +14,10 @@
   "scripts": {
     "foreman": "node harness/cli.mjs",
     "demo": "node harness/cli.mjs demo",
-    "console": "node apps/console/server.mjs",
+    "console": "node harness/cli.mjs approvals",
     "seed": "node scripts/seed.mjs",
+    "trueforge:smoke": "node scripts/tf-smoke.mjs",
+    "test:trueforge": "FOREMAN_TRUEFORGE_LIVE=true node --test harness/test/trueforge.live.test.mjs",
     "test": "node --test \"harness/test/*.test.mjs\""
   }
 }
