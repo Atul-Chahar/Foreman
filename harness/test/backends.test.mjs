@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { TrueForgeBackend, LocalBackend } from '../subagents/backends.mjs';
+import {
+  TrueForgeBackend,
+  LocalBackend,
+  extractTrueForgeFiles,
+} from '../subagents/backends.mjs';
 
 const SPEC = {
   id: 'task-001',
@@ -19,21 +23,50 @@ function stubFetch(routes) {
     const route = routes.find((r) => r.match.test(url) && (r.method ?? 'GET') === (opts.method ?? 'GET'));
     if (!route) return { ok: false, status: 404, text: async () => 'no route' };
     if (route.fail) return { ok: false, status: route.status ?? 500, text: async () => route.failText ?? 'boom' };
+    if (route.sse) return { ok: true, status: 200, text: async () => route.sse };
     return { ok: true, status: 200, json: async () => (typeof route.respond === 'function' ? route.respond(calls.length, JSON.parse(opts.body ?? 'null')) : route.respond) };
   };
   fn.calls = calls;
   return fn;
 }
 
+function executionDeps({ authorize = async () => ({ allowed: true }) } = {}) {
+  const calls = [];
+  return {
+    calls,
+    github: {
+      createBranch: async (branch) => calls.push(['create_branch', branch]),
+      commitFiles: async (branch, files) => calls.push(['commit_files', branch, files]),
+    },
+    sandbox: {
+      exec: async (args) => {
+        calls.push(['test', args]);
+        return { ok: true, exitCode: 0 };
+      },
+    },
+    authorize,
+  };
+}
+
 test('trueforge backend: session -> turn -> poll speaks the documented protocol', async () => {
   const fetchImpl = stubFetch([
-    { match: /\/api\/v1\/sessions$/, method: 'POST', respond: { id: 'sess-1' } },
+    { match: /\/api\/v1\/sessions$/, method: 'POST', respond: { data: { id: 'sess-1' } } },
     { match: /\/sessions\/sess-1\/turns$/, method: 'POST', respond: { id: 'turn-1' } },
-    { match: /\/sessions\/sess-1\/turns\/turn-1$/, respond: { state: { status: 'done', output: { content: 'did it' } } } },
+    {
+      match: /\/sessions\/sess-1\/turns\/turn-1$/,
+      respond: {
+        state: {
+          status: 'done',
+          output: { content: '{"files":[{"path":"src/search.mjs","content":"export {};"}]}' },
+        },
+      },
+    },
   ]);
+  const deps = executionDeps();
   const backend = new TrueForgeBackend({
     config: { trueforgeUrl: 'http://tf.local', trueforgeToken: 'tok', trueforgeModel: 'acme/model-1' },
     fetchImpl,
+    ...deps,
   });
 
   const result = await backend.run({ spec: SPEC, branch: 'foreman/task-001' });
@@ -55,6 +88,8 @@ test('trueforge backend: session -> turn -> poll speaks the documented protocol'
   assert.equal(result.ok, true);
   assert.equal(result.sessionId, 'sess-1');
   assert.equal(result.turnId, 'turn-1');
+  assert.deepEqual(deps.calls.map((c) => c[0]), ['create_branch', 'commit_files', 'test']);
+  assert.deepEqual(result.files, ['src/search.mjs']);
 });
 
 test('trueforge backend: error turns map to ok:false; auth header present when token set', async () => {
@@ -66,6 +101,7 @@ test('trueforge backend: error turns map to ok:false; auth header present when t
   const backend = new TrueForgeBackend({
     config: { trueforgeUrl: 'http://tf.local/', trueforgeToken: 'secret-token' },
     fetchImpl,
+    ...executionDeps(),
   });
   const result = await backend.run({ spec: SPEC, branch: 'b' });
   assert.equal(result.ok, false);
@@ -73,6 +109,68 @@ test('trueforge backend: error turns map to ok:false; auth header present when t
   assert.equal(fetchImpl.calls[0].body && undefined, undefined);
   // authorization header on every call
   assert.ok(backend._headers().authorization === 'Bearer secret-token');
+});
+
+test('trueforge backend: invalid or unsafe file output is refused before writes', async () => {
+  const fetchImpl = stubFetch([
+    { match: /\/api\/v1\/sessions$/, method: 'POST', respond: { id: 's3' } },
+    { match: /\/turns$/, method: 'POST', respond: { id: 't3' } },
+    {
+      match: /turns\/t3$/,
+      respond: { state: { status: 'completed', output: '```json\n{"files":[{"path":"../escape","content":"x"}]}\n```' } },
+    },
+  ]);
+  const deps = executionDeps();
+  const backend = new TrueForgeBackend({
+    config: { trueforgeUrl: 'http://tf.local' },
+    fetchImpl,
+    ...deps,
+  });
+  const result = await backend.run({ spec: SPEC, branch: 'b' });
+  assert.equal(result.ok, false);
+  assert.equal(result.permanent, true);
+  assert.deepEqual(deps.calls, []);
+});
+
+test('trueforge backend: current SSE turn stream completes without a polling GET', async () => {
+  const output = { content: '{"files":[{"path":"src/search.mjs","content":"export {};"}]}' };
+  const fetchImpl = stubFetch([
+    { match: /\/api\/v1\/sessions$/, method: 'POST', respond: { data: { id: 'sse-session' } } },
+    {
+      match: /\/turns$/,
+      method: 'POST',
+      sse: [
+        `data: ${JSON.stringify({ type: 'turn.created', turn_id: 'sse-turn.local', state: { status: 'running' } })}`,
+        `data: ${JSON.stringify({ type: 'turn.done', state: { status: 'done', output, metrics: { total_tokens: 3 } } })}`,
+        '',
+      ].join('\n'),
+    },
+  ]);
+  const deps = executionDeps();
+  const backend = new TrueForgeBackend({
+    config: { trueforgeUrl: 'http://tf.local' },
+    fetchImpl,
+    ...deps,
+  });
+  const result = await backend.run({ spec: SPEC, branch: 'foreman/task-001' });
+  assert.equal(result.ok, true);
+  assert.equal(result.turnId, 'sse-turn.local');
+  assert.equal(result.metrics.total_tokens, 3);
+  assert.equal(fetchImpl.calls.length, 2, 'the terminal SSE event makes GET polling unnecessary');
+});
+
+test('trueforge output extraction handles content blocks and fails closed on unsafe paths', () => {
+  const output = [{ type: 'assistant.message', content: [{ text: [
+    'Result:',
+    '```json',
+    '{"files":[{"path":"src/ok.mjs","content":"x"},{"path":"/bad","content":"x"}]}',
+    '```',
+  ].join('\n') }] }];
+  assert.deepEqual(extractTrueForgeFiles(output), []);
+  assert.deepEqual(
+    extractTrueForgeFiles({ content: '{"files":[{"path":"src/ok.mjs","content":"x"}]}' }),
+    [{ path: 'src/ok.mjs', content: 'x' }],
+  );
 });
 
 test('local backend: writes are refused without an authorize bridge — fail closed', () => {

@@ -173,10 +173,13 @@ export class ApprovalGate {
   }
 
   /** On startup: cancel approvals whose tasks have moved on. Approvals for
-   *  tasks still upstream of the gate (tests passed, awaiting their turn in
-   *  the queue) are legitimate and must survive. */
+   *  tasks still working (dispatched, running, tests passed, queued) are
+   *  legitimate and must survive console sessions. */
   cancelOrphans() {
-    const activeStates = new Set(['awaiting_approval', 'pr_open', 'tests_passed']);
+    const activeStates = new Set([
+      'awaiting_approval', 'pr_open', 'tests_passed',
+      'planned', 'dispatched', 'running', 'tests_failed', 'failed',
+    ]);
     for (const a of this.pending()) {
       const task = this.store.getTask(a.task_id);
       if (!task || !activeStates.has(task.state)) this.cancel(a.id, 'task no longer awaiting approval');
@@ -185,8 +188,7 @@ export class ApprovalGate {
 }
 
 function sleep(ms) {
-  return new Promise((r) => {
-    const t = setTimeout(r, ms);
-    if (typeof t.unref === 'function') t.unref(); // waiting must not pin the process
-  });
+  // A pending human decision is live CLI work. Keeping this timer referenced
+  // prevents Node from exiting cleanly while runBacklog() is still waiting.
+  return new Promise((r) => setTimeout(r, ms));
 }
